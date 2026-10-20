@@ -1,0 +1,6 @@
+ipsw/
+*.dmg
+root.img
+phone*.img
+out/
+__pycache__/

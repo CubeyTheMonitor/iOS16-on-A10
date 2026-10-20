@@ -1,0 +1,2067 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..bf085da 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,9 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/a40_blk.c			standard
++bsd/dev/a40_keys.c			standard
++bsd/dev/a40_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a40_blk.c b/bsd/dev/a40_blk.c
+new file mode 100644
+index 0000000..37df2d7
+--- /dev/null
++++ b/bsd/dev/a40_blk.c
+@@ -0,0 +1,616 @@
++/*
++ * A40 block backends for bsd/dev/sweet_ufs.c (same 4 KiB "device block"
++ * interface and the same 1 MiB bounce buffer as the UFS path):
++ *
++ *   - "a40,dwmmc": Exynos 7904 eMMC (Synopsys DesignWare MSHC, dwmmc0 at
++ *     0x13500000). S-Boot leaves the controller clocked and the card in the
++ *     transfer state after loading boot.img, so nothing is (re)initialised:
++ *     the driver only disables the internal DMA, resets the FIFO and moves
++ *     data by PIO with multi-block CMD18 / CMD25 (+ auto stop). Card is
++ *     sector addressed (eMMC > 2 GB), 512-byte sectors.
++ *   - "virtio,mmio": QEMU virt virtio-blk (legacy virtio-mmio v1, one
++ *     polled queue), used to run the whole iOS boot in the emulator.
++ *
++ * Everything is polled; no interrupts are used.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <machine/machine_routines.h>
++#include <libkern/OSAtomic.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#define BLK4K           4096u
++#define SECT            512u
++#define SECT_PER_BLK    (BLK4K / SECT)
++
++int a40_blk_kind;                       /* 0 none, 1 dwmmc, 2 virtio */
++static vm_offset_t a40_regs;
++static vm_offset_t a40_bounce;          /* VA of the shared 1 MiB bounce buffer */
++static uint64_t a40_bounce_pa;
++static uint32_t a40_bounce_size;
++
++static inline uint32_t
++r32(uint32_t off)
++{
++	return *(volatile uint32_t *)(a40_regs + off);
++}
++
++static inline void
++w32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(a40_regs + off) = v;
++}
++
++static bool
++timed_out(uint64_t deadline)
++{
++	return mach_absolute_time() > deadline;
++}
++
++static uint64_t
++deadline_ms(uint32_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	return mach_absolute_time() + t;
++}
++
++/* ------------------------------------------------------------------ */
++/* DesignWare MSHC (dw_mmc), register offsets from Linux dw_mmc.h      */
++
++#define DW_CTRL         0x000
++#define DW_CLKENA       0x010
++#define DW_TMOUT        0x014
++#define DW_CTYPE        0x018
++#define DW_BLKSIZ       0x01c
++#define DW_BYTCNT       0x020
++#define DW_INTMASK      0x024
++#define DW_CMDARG       0x028
++#define DW_CMD          0x02c
++#define DW_RESP0        0x030
++#define DW_MINTSTS      0x040
++#define DW_RINTSTS      0x044
++#define DW_STATUS       0x048
++#define DW_FIFOTH       0x04c
++#define DW_VERID        0x06c
++#define DW_BMOD         0x080
++#define DW_IDINTEN      0x090
++
++#define CTRL_RESET              (1u << 0)
++#define CTRL_FIFO_RESET         (1u << 1)
++#define CTRL_DMA_RESET          (1u << 2)
++#define CTRL_INT_ENABLE         (1u << 4)
++#define CTRL_DMA_ENABLE         (1u << 5)
++#define CTRL_USE_IDMAC          (1u << 25)
++
++#define CMD_START               (1u << 31)
++#define CMD_USE_HOLD_REG        (1u << 29)
++#define CMD_PRV_DAT_WAIT        (1u << 13)
++#define CMD_SEND_STOP           (1u << 12)
++#define CMD_DAT_WR              (1u << 10)
++#define CMD_DAT_EXP             (1u << 9)
++#define CMD_RESP_CRC            (1u << 8)
++#define CMD_RESP_EXP            (1u << 6)
++
++#define INT_EBE                 (1u << 15)      /* end-bit error (read) / write no CRC */
++#define INT_ACD                 (1u << 14)      /* auto command done */
++#define INT_SBE                 (1u << 13)      /* start-bit / busy clear */
++#define INT_HLE                 (1u << 12)
++#define INT_FRUN                (1u << 11)
++#define INT_HTO                 (1u << 10)
++#define INT_DRTO                (1u << 9)
++#define INT_RTO                 (1u << 8)
++#define INT_DCRC                (1u << 7)
++#define INT_RCRC                (1u << 6)
++#define INT_RXDR                (1u << 5)
++#define INT_TXDR                (1u << 4)
++#define INT_DTO                 (1u << 3)
++#define INT_CMD_DONE            (1u << 2)
++#define INT_RESP_ERR            (1u << 1)
++#define INT_DATA_ERR            (INT_EBE | INT_SBE | INT_HLE | INT_FRUN | INT_DCRC | INT_DRTO)
++#define INT_CMD_ERR             (INT_RTO | INT_RCRC | INT_RESP_ERR | INT_HLE)
++
++#define STATUS_FIFO_COUNT(s)    (((s) >> 17) & 0x1fff)
++#define STATUS_BUSY             (1u << 9)
++
++static uint32_t dw_data;                /* FIFO offset: 0x100 before 2.40a, else 0x200 */
++static uint32_t dw_fifo_words;          /* FIFO depth in entries (32 or 64 bit) */
++static bool dw_hold;                    /* CMD_USE_HOLD_REG like the bootloader */
++static bool dw_fifo64;                  /* HCON H_DATA_WIDTH = 64 bit (Exynos) */
++static uint32_t dw_rca = 1;
++uint32_t a40_mmc_diag[8];               /* shown by the persistent log / panics */
++
++static int
++dw_wait_cmd_taken(void)
++{
++	uint64_t dl = deadline_ms(500);
++	while (r32(DW_CMD) & CMD_START) {
++		if (timed_out(dl)) {
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++static int
++dw_wait_not_busy(uint32_t ms)
++{
++	uint64_t dl = deadline_ms(ms);
++	while (r32(DW_STATUS) & STATUS_BUSY) {
++		if (timed_out(dl)) {
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++/* Issue a command; for data commands the caller moves the FIFO afterwards. */
++static int
++dw_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t *resp)
++{
++	int e = dw_wait_not_busy(1000);
++	if (e && !(flags & CMD_DAT_EXP)) {
++		/* busy only matters for commands that wait for previous data */
++	}
++	w32(DW_RINTSTS, 0xffffffff);
++	w32(DW_CMDARG, arg);
++	__builtin_arm_dsb(0xf);
++	w32(DW_CMD, CMD_START | (dw_hold ? CMD_USE_HOLD_REG : 0) | flags | (idx & 0x3f));
++	if ((e = dw_wait_cmd_taken())) {
++		a40_mmc_diag[0] = 0xC0DE0000 | idx;
++		return e;
++	}
++	uint64_t dl = deadline_ms(1000);
++	uint32_t st;
++	while (!((st = r32(DW_RINTSTS)) & (INT_CMD_DONE | INT_CMD_ERR))) {
++		if (timed_out(dl)) {
++			a40_mmc_diag[1] = 0xC0DE1000 | idx;
++			return ETIMEDOUT;
++		}
++	}
++	if (st & INT_CMD_ERR) {
++		a40_mmc_diag[2] = st;
++		a40_mmc_diag[3] = idx;
++		return EIO;
++	}
++	if (resp) {
++		*resp = r32(DW_RESP0);
++	}
++	return 0;
++}
++
++#define R1      (CMD_RESP_EXP | CMD_RESP_CRC)
++
++static int
++dw_card_ready(void)
++{
++	/* CMD13 SEND_STATUS until READY_FOR_DATA in TRAN state */
++	uint64_t dl = deadline_ms(2000);
++	for (;;) {
++		uint32_t st = 0;
++		int e = dw_cmd(13, dw_rca << 16, R1 | CMD_PRV_DAT_WAIT, &st);
++		if (!e && (st & (1u << 8)) && ((st >> 9) & 0xf) == 4) {
++			return 0;
++		}
++		if (timed_out(dl)) {
++			a40_mmc_diag[4] = st;
++			return e ? e : ETIMEDOUT;
++		}
++	}
++}
++
++static void
++dw_fifo_reset(void)
++{
++	w32(DW_CTRL, r32(DW_CTRL) | CTRL_FIFO_RESET);
++	uint64_t dl = deadline_ms(100);
++	while ((r32(DW_CTRL) & CTRL_FIFO_RESET) && !timed_out(dl)) {
++	}
++}
++
++/* sectors of 512 bytes at sector address 'sect', to/from the bounce buffer */
++/* FIFO_COUNT and the data port use the FIFO width (32 or 64 bit). */
++static void
++dw_fifo_read(volatile uint32_t *buf, uint32_t *done, uint32_t words)
++{
++	uint32_t n = STATUS_FIFO_COUNT(r32(DW_STATUS));
++	if (dw_fifo64) {
++		volatile uint64_t *b64 = (volatile uint64_t *)buf;
++		while (n-- && *done < words) {
++			b64[*done / 2] = *(volatile uint64_t *)(a40_regs + dw_data);
++			*done += 2;
++		}
++		return;
++	}
++	while (n-- && *done < words) {
++		buf[(*done)++] = *(volatile uint32_t *)(a40_regs + dw_data);
++	}
++}
++
++static void
++dw_fifo_write(volatile uint32_t *buf, uint32_t *done, uint32_t words)
++{
++	uint32_t fill = STATUS_FIFO_COUNT(r32(DW_STATUS));
++	uint32_t room = fill < dw_fifo_words ? dw_fifo_words - fill : 0;
++	if (dw_fifo64) {
++		volatile uint64_t *b64 = (volatile uint64_t *)buf;
++		while (room-- && *done < words) {
++			*(volatile uint64_t *)(a40_regs + dw_data) = b64[*done / 2];
++			*done += 2;
++		}
++		return;
++	}
++	while (room-- && *done < words) {
++		*(volatile uint32_t *)(a40_regs + dw_data) = buf[(*done)++];
++	}
++}
++
++static int
++dw_xfer(uint64_t sect, uint32_t nsect, bool write)
++{
++	if (sect > UINT32_MAX || nsect == 0) {
++		return EINVAL;
++	}
++	int e = dw_card_ready();
++	if (e) {
++		return e;
++	}
++	dw_fifo_reset();
++	uint32_t bytes = nsect * SECT;
++	w32(DW_BLKSIZ, SECT);
++	w32(DW_BYTCNT, bytes);
++	uint32_t idx = write ? (nsect > 1 ? 25 : 24) : (nsect > 1 ? 18 : 17);
++	uint32_t flags = R1 | CMD_DAT_EXP | CMD_PRV_DAT_WAIT |
++	    (write ? CMD_DAT_WR : 0) | (nsect > 1 ? CMD_SEND_STOP : 0);
++	if ((e = dw_cmd(idx, (uint32_t)sect, flags, NULL))) {
++		goto fail;
++	}
++	volatile uint32_t *buf = (volatile uint32_t *)a40_bounce;
++	uint32_t words = bytes / 4, done = 0;
++	uint64_t dl = deadline_ms(5000);
++	for (;;) {
++		uint32_t is = r32(DW_RINTSTS);
++		if (is & INT_DATA_ERR) {
++			a40_mmc_diag[5] = is;
++			e = EIO;
++			goto fail;
++		}
++		if (!write) {
++			dw_fifo_read(buf, &done, words);
++			if (is & INT_RXDR) {
++				w32(DW_RINTSTS, INT_RXDR);
++			}
++		} else if (done < words) {
++			dw_fifo_write(buf, &done, words);
++			if (is & INT_TXDR) {
++				w32(DW_RINTSTS, INT_TXDR);
++			}
++		}
++		if ((is & INT_DTO) && (write || done >= words)) {
++			break;
++		}
++		if (timed_out(dl)) {
++			a40_mmc_diag[6] = is;
++			a40_mmc_diag[7] = done;
++			e = ETIMEDOUT;
++			goto fail;
++		}
++	}
++	if (!write) {
++		/* drain anything left after DTO */
++		dw_fifo_read(buf, &done, words);
++		if (done < words) {
++			a40_mmc_diag[7] = 0xD0000000 | done;
++			e = EIO;
++			goto fail;
++		}
++	}
++	if (nsect > 1) {
++		/* auto stop (CMD12) completes with ACD */
++		uint64_t d2 = deadline_ms(1000);
++		while (!(r32(DW_RINTSTS) & INT_ACD) && !timed_out(d2)) {
++		}
++	}
++	w32(DW_RINTSTS, 0xffffffff);
++	return dw_wait_not_busy(2000);
++fail:
++	/* stop any open-ended transfer and get the card back to TRAN */
++	(void)dw_cmd(12, 0, R1 | (1u << 14) /* stop_abort_cmd */, NULL);
++	dw_fifo_reset();
++	w32(DW_RINTSTS, 0xffffffff);
++	return e;
++}
++
++static uint32_t dw_boot[12];            /* controller state left by S-Boot */
++
++static void __dead2
++a40_mmc_fail(const char *stage, int e)
++{
++	panic("A40 MMC %s err %d rca %u | boot ctrl %x clkena %x clkdiv %x ctype %x status %x "
++	    "rint %x cmd %x arg %x resp0 %x uhs %x clksel %x verid %x | now status %x rint %x cmd %x | "
++	    "hcon %x | diag %x %x %x %x %x %x %x %x", stage, e, dw_rca,
++	    dw_boot[0], dw_boot[1], dw_boot[2], dw_boot[3], dw_boot[4], dw_boot[5], dw_boot[6],
++	    dw_boot[7], dw_boot[8], dw_boot[9], dw_boot[10], dw_boot[11],
++	    r32(DW_STATUS), r32(DW_RINTSTS), r32(DW_CMD), r32(0x070),
++	    a40_mmc_diag[0], a40_mmc_diag[1], a40_mmc_diag[2], a40_mmc_diag[3],
++	    a40_mmc_diag[4], a40_mmc_diag[5], a40_mmc_diag[6], a40_mmc_diag[7]);
++}
++
++static int
++dw_probe(void)
++{
++	static const uint16_t snap[12] = { 0x000, 0x010, 0x008, 0x018, 0x048, 0x044, 0x02c, 0x028,
++		                           0x030, 0x074, 0x09c, 0x06c };
++	for (int i = 0; i < 12; i++) {
++		dw_boot[i] = r32(snap[i]);
++	}
++	uint32_t ver = r32(DW_VERID) & 0xffff;
++	dw_data = ver < 0x240a ? 0x100 : 0x200;
++	uint32_t fifoth = r32(DW_FIFOTH);
++	dw_fifo_words = ((fifoth >> 16) & 0xfff) + 1;           /* RX_WMark + 1 = depth/2 */
++	dw_fifo_words = dw_fifo_words * 2;                      /* FIFO entries (32 or 64 bit) */
++	if (dw_fifo_words < 16 || dw_fifo_words > 4096) {
++		dw_fifo_words = 64;                             /* dts fifo-depth = <0x40> */
++	}
++	dw_hold = true;
++	dw_fifo64 = ((r32(0x070) >> 7) & 7) == 2;              /* HCON: 0 16-bit, 1 32-bit, 2 64-bit */
++	printf("A40 MMC: dw_mmc verid 0x%x ctrl 0x%x clkena 0x%x ctype 0x%x status 0x%x fifo %u words\n",
++	    ver, r32(DW_CTRL), r32(DW_CLKENA), r32(DW_CTYPE), r32(DW_STATUS), dw_fifo_words);
++	if (!r32(DW_CLKENA)) {
++		a40_mmc_fail("clock off", ENXIO);
++	}
++	/* polled PIO: no interrupts, no internal DMA */
++	w32(DW_INTMASK, 0);
++	w32(DW_IDINTEN, 0);
++	w32(DW_CTRL, (r32(DW_CTRL) & ~(CTRL_INT_ENABLE | CTRL_DMA_ENABLE | CTRL_USE_IDMAC)));
++	w32(DW_BMOD, r32(DW_BMOD) & ~(1u << 7));                /* IDMAC off */
++	w32(DW_CTRL, r32(DW_CTRL) | CTRL_DMA_RESET | CTRL_FIFO_RESET);
++	uint64_t dl = deadline_ms(100);
++	while ((r32(DW_CTRL) & (CTRL_DMA_RESET | CTRL_FIFO_RESET)) && !timed_out(dl)) {
++	}
++	w32(DW_TMOUT, 0xffffffff);
++	w32(DW_RINTSTS, 0xffffffff);
++	/* eMMC RCA: S-Boot (like Linux) assigns 1; check, else try 2 */
++	if (dw_card_ready() != 0) {
++		dw_rca = 2;
++		if (dw_card_ready() != 0) {
++			a40_mmc_fail("CMD13 not tran", EIO);
++		}
++	}
++	printf("A40 MMC: card RCA %u ready\n", dw_rca);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* virtio-mmio legacy (v1) block device, QEMU virt                      */
++
++#define VIO_MAGIC       0x000
++#define VIO_VERSION     0x004
++#define VIO_DEVICE_ID   0x008
++#define VIO_HOST_FEAT   0x010
++#define VIO_GUEST_FEAT  0x020
++#define VIO_GUEST_PGSZ  0x028
++#define VIO_QSEL        0x030
++#define VIO_QNUM_MAX    0x034
++#define VIO_QNUM        0x038
++#define VIO_QALIGN      0x03c
++#define VIO_QPFN        0x040
++#define VIO_QNOTIFY     0x050
++#define VIO_ISR         0x060
++#define VIO_ISR_ACK     0x064
++#define VIO_STATUS      0x070
++#define VIO_CONFIG      0x100
++
++#define VQ_N            8
++struct vq_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags, next;
++};
++struct vblk_req {
++	uint32_t type, reserved;
++	uint64_t sector;
++};
++
++/* queue memory: 4 KiB aligned, legacy layout (desc, avail, pad, used) */
++static vm_offset_t vq_mem;
++static uint64_t vq_pa;
++static uint16_t vq_avail_idx, vq_used_seen;
++#define VQ_DESC         0x000
++#define VQ_AVAIL        (VQ_N * 16)
++#define VQ_USED         0x1000
++#define VQ_REQ          0x2000
++#define VQ_STATUSB      0x2040
++#define VQ_MEM          0x3000
++
++static void
++vq_sync(void)
++{
++	flush_dcache64((addr64_t)vq_pa, VQ_MEM, TRUE);
++}
++
++static int
++vio_xfer(uint64_t sect, uint32_t nsect, bool write)
++{
++	volatile struct vq_desc *d = (volatile struct vq_desc *)(vq_mem + VQ_DESC);
++	volatile struct vblk_req *rq = (volatile struct vblk_req *)(vq_mem + VQ_REQ);
++	volatile uint8_t *status = (volatile uint8_t *)(vq_mem + VQ_STATUSB);
++	volatile uint16_t *avail = (volatile uint16_t *)(vq_mem + VQ_AVAIL);
++	volatile uint16_t *used = (volatile uint16_t *)(vq_mem + VQ_USED);
++
++	rq->type = write ? 1 : 0;
++	rq->reserved = 0;
++	rq->sector = sect;
++	*status = 0xff;
++	d[0].addr = vq_pa + VQ_REQ;
++	d[0].len = sizeof(struct vblk_req);
++	d[0].flags = 1;                 /* NEXT */
++	d[0].next = 1;
++	d[1].addr = a40_bounce_pa;
++	d[1].len = nsect * SECT;
++	d[1].flags = 1 | (write ? 0 : 2);       /* NEXT | WRITE(device writes) */
++	d[1].next = 2;
++	d[2].addr = vq_pa + VQ_STATUSB;
++	d[2].len = 1;
++	d[2].flags = 2;
++	d[2].next = 0;
++	avail[2 + (vq_avail_idx % VQ_N)] = 0;
++	__builtin_arm_dmb(0xf);
++	avail[1] = ++vq_avail_idx;
++	flush_dcache64((addr64_t)a40_bounce_pa, nsect * SECT, TRUE);
++	vq_sync();
++	__builtin_arm_dsb(0xf);
++	w32(VIO_QNOTIFY, 0);
++	uint64_t dl = deadline_ms(10000);
++	for (;;) {
++		vq_sync();
++		if (used[1] != vq_used_seen) {
++			break;
++		}
++		if (timed_out(dl)) {
++			return ETIMEDOUT;
++		}
++	}
++	vq_used_seen = used[1];
++	w32(VIO_ISR_ACK, r32(VIO_ISR));
++	flush_dcache64((addr64_t)a40_bounce_pa, nsect * SECT, TRUE);
++	return *status == 0 ? 0 : EIO;
++}
++
++
++static int
++vio_probe(uint64_t base_pa, uint32_t slots, uint32_t stride)
++{
++	for (uint32_t i = 0; i < slots; i++) {
++		vm_offset_t r = ml_io_map(base_pa + (uint64_t)i * stride, stride);
++		uint32_t magic = *(volatile uint32_t *)(r + VIO_MAGIC);
++		uint32_t devid = *(volatile uint32_t *)(r + VIO_DEVICE_ID);
++		if (magic == 0x74726976 && devid == 2) {
++			a40_regs = r;
++			break;
++		}
++	}
++	if (!a40_regs) {
++		printf("A40 VIRTIO: no virtio-blk device\n");
++		return ENXIO;
++	}
++	if (r32(VIO_VERSION) != 1) {
++		printf("A40 VIRTIO: version %u (need legacy 1: -global virtio-mmio.force-legacy=true)\n", r32(VIO_VERSION));
++		return ENXIO;
++	}
++	w32(VIO_STATUS, 0);
++	w32(VIO_STATUS, 1 | 2);         /* ACK | DRIVER */
++	w32(VIO_GUEST_FEAT, 0);
++	w32(VIO_GUEST_PGSZ, 4096);
++	w32(VIO_QSEL, 0);
++	if (r32(VIO_QNUM_MAX) < VQ_N) {
++		return ENXIO;
++	}
++	if (kmem_alloc_contig(kernel_map, &vq_mem, VQ_MEM, 0x3fff, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	vq_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)vq_mem));
++	vq_sync();
++	w32(VIO_QNUM, VQ_N);
++	w32(VIO_QALIGN, 4096);
++	w32(VIO_QPFN, (uint32_t)(vq_pa >> 12));
++	w32(VIO_STATUS, 1 | 2 | 4);     /* DRIVER_OK */
++	uint64_t cap = *(volatile uint32_t *)(a40_regs + VIO_CONFIG) |
++	    ((uint64_t)*(volatile uint32_t *)(a40_regs + VIO_CONFIG + 4) << 32);
++	printf("A40 VIRTIO: virtio-blk %llu MiB, queue at 0x%llx\n", cap * SECT >> 20, vq_pa);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Interface used by sweet_ufs.c                                       */
++
++int a40_blk_probe(vm_offset_t bounce, uint64_t bounce_pa, uint32_t bounce_size);
++int a40_blk_read(uint64_t blk4k, uint32_t count);
++int a40_blk_write(uint64_t blk4k, uint32_t count);
++
++int
++a40_blk_probe(vm_offset_t bounce, uint64_t bounce_pa, uint32_t bounce_size)
++{
++	DTEntry node;
++	uint64_t const *reg = NULL;
++	unsigned int size = 0;
++
++	a40_bounce = bounce;
++	a40_bounce_pa = bounce_pa;
++	a40_bounce_size = bounce_size;
++	if (SecureDTLookupEntry(NULL, "/a40-mmc", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess && size >= 16) {
++		a40_regs = ml_io_map(reg[0], reg[1]);
++		if (dw_probe() == 0) {
++			a40_blk_kind = 1;
++			return 0;
++		}
++		return EIO;
++	}
++	if (SecureDTLookupEntry(NULL, "/a40-virtio", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess && size >= 16) {
++		if (vio_probe(reg[0], (uint32_t)(reg[1] / 0x200), 0x200) == 0) {
++			a40_blk_kind = 2;
++			return 0;
++		}
++		return EIO;
++	}
++	return ENOENT;
++}
++
++static int
++a40_blk_xfer(uint64_t blk4k, uint32_t count, bool write)
++{
++	if ((uint64_t)count * BLK4K > a40_bounce_size) {
++		return EINVAL;
++	}
++	uint64_t sect = blk4k * SECT_PER_BLK;
++	uint32_t nsect = count * SECT_PER_BLK;
++	int e;
++	if (a40_blk_kind == 1) {
++		/* dw_mmc PIO: at most 128 KiB per command keeps BYTCNT and timeouts sane */
++		for (uint32_t done = 0; done < nsect;) {
++			uint32_t n = MIN(nsect - done, 256u);
++			vm_offset_t save = a40_bounce;
++			a40_bounce += (vm_offset_t)done * SECT;
++			e = dw_xfer(sect + done, n, write);
++			a40_bounce = save;
++			if (e) {
++				a40_mmc_fail(write ? "write" : "read", e);
++				printf("A40 MMC: %s of %u sectors at 0x%llx failed %d (diag %x %x %x %x %x %x %x %x)\n",
++				    write ? "write" : "read", n, sect + done, e,
++				    a40_mmc_diag[0], a40_mmc_diag[1], a40_mmc_diag[2], a40_mmc_diag[3],
++				    a40_mmc_diag[4], a40_mmc_diag[5], a40_mmc_diag[6], a40_mmc_diag[7]);
++				return e;
++			}
++			done += n;
++		}
++		return 0;
++	}
++	if (a40_blk_kind == 2) {
++		return vio_xfer(sect, nsect, write);
++	}
++	return ENXIO;
++}
++
++int
++a40_blk_read(uint64_t blk4k, uint32_t count)
++{
++	return a40_blk_xfer(blk4k, count, false);
++}
++
++int
++a40_blk_write(uint64_t blk4k, uint32_t count)
++{
++	return a40_blk_xfer(blk4k, count, true);
++}
+diff --git a/bsd/dev/a40_keys.c b/bsd/dev/a40_keys.c
+new file mode 100644
+index 0000000..73ba0e4
+--- /dev/null
++++ b/bsd/dev/a40_keys.c
+@@ -0,0 +1,102 @@
++/*
++ * Galaxy A40 keys: plain GPIOs of the ALIVE pin controller (bank GPA1,
++ * 0x11CB0060: CON +0, DAT +4), active low. S-Boot leaves them configured
++ * as inputs (gpio-keys pin function 0xf = EINT, DAT still reads the level).
++ * Polled every 20 ms from a kernel thread; reported like the SWEET keys:
++ * 0 = power (gpa1-7), 1 = volume up (gpa1-5), 2 = volume down (gpa1-6).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/cpu_number.h>
++#include <mach/mach_time.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++int a40_keys_init(void);
++int a40_platform(void);
++
++static vm_offset_t a40_gpa1;
++static int a40_keys_chan;
++
++static void
++a40_keys_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static const int pin[3] = { 7, 5, 6 };
++	int state[3] = { 0, 0, 0 };
++	for (;;) {
++		uint32_t dat = *(volatile uint32_t *)(a40_gpa1 + 4);
++		for (int k = 0; k < 3; k++) {
++			int down = !(dat & (1u << pin[k]));
++			if (down != state[k]) {
++				state[k] = down;
++				printf("A40 KEYS: key=%d down=%d dat=%#x\n", k, down, dat);
++				sweet_hid_key(k, down);
++			}
++		}
++		assert_wait_timeout((event_t)&a40_keys_chan, THREAD_UNINT, 20, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++/* Returns 1 when this board has A40 keys (and they were started). */
++/* A40 ADT (phone or QEMU): sweet's Qualcomm drivers must not touch the bus. */
++int
++a40_platform(void)
++{
++	DTEntry node;
++	return SecureDTLookupEntry(NULL, "/a40-mmc", &node) == kSuccess ||
++	       SecureDTLookupEntry(NULL, "/a40-virtio", &node) == kSuccess;
++}
++
++/* A40 diag: A73 cluster clock (CMU_CPUCL0) and measured core frequency. */
++static void
++a40_clock_report(void)
++{
++	vm_offset_t cl0 = ml_io_map(0x10900000, 0x2000);
++	uint32_t pll = *(volatile uint32_t *)(cl0 + 0x140);
++	uint32_t mux = *(volatile uint32_t *)(cl0 + 0x1000);
++	uint32_t div = *(volatile uint32_t *)(cl0 + 0x1810);
++	uint32_t m = (pll >> 16) & 0x3ff, pdiv = (pll >> 8) & 0x3f, sdiv = pll & 7;
++	uint64_t pll_mhz = pdiv ? 26ULL * m / ((uint64_t)pdiv << sdiv) : 0;
++	/* cycle counter over ~50 ms of the 26 MHz timebase */
++	__builtin_arm_wsr64("PMCR_EL0", __builtin_arm_rsr64("PMCR_EL0") | 1);
++	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ULL << 31);
++	__builtin_arm_isb(0xf);
++	uint64_t c0 = __builtin_arm_rsr64("PMCCNTR_EL0"), t0 = mach_absolute_time();
++	while (mach_absolute_time() - t0 < 26000 * 50) {
++	}
++	uint64_t c1 = __builtin_arm_rsr64("PMCCNTR_EL0"), t1 = mach_absolute_time();
++	uint64_t mhz = (c1 - c0) * 26 / (t1 - t0);
++	printf("A40 CLOCK: cpu %d PLL_CPUCL0 %#x (%llu MHz) mux %#x div %#x, measured %llu MHz\n",
++	    cpu_number(), pll, pll_mhz, mux, div, mhz);
++}
++
++int
++a40_keys_init(void)
++{
++	DTEntry node;
++	uint64_t const *reg;
++	unsigned int size;
++	thread_t th;
++
++	if (SecureDTLookupEntry(NULL, "/a40-mmc", &node) == kSuccess) {
++		a40_clock_report();
++	}
++	if (SecureDTLookupEntry(NULL, "/a40-keys", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		return a40_platform();  /* A40 without keys (QEMU): never probe sweet's SPMI */
++	}
++	a40_gpa1 = ml_io_map(reg[0] & ~0xfffULL, 0x1000) + (reg[0] & 0xfff);
++	printf("A40 KEYS: gpa1 con %#x dat %#x\n", *(volatile uint32_t *)a40_gpa1,
++	    *(volatile uint32_t *)(a40_gpa1 + 4));
++	if (kernel_thread_start(a40_keys_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	return 1;
++}
+diff --git a/bsd/dev/a40_touch.c b/bsd/dev/a40_touch.c
+new file mode 100644
+index 0000000..c640939
+--- /dev/null
++++ b/bsd/dev/a40_touch.c
+@@ -0,0 +1,275 @@
++/*
++ * Galaxy A40 touchscreen: Zinitix ZT7548 at 0x20 on i2c_4 (Samsung
++ * s3c2440-style I2C controller at 0x13870000, pins gpp4-0/1 function 2),
++ * powered by tsp_avdd (gpg2-1, active high), attention line gpa0-0 (low =
++ * data ready). Everything polled from a kernel thread; protocol from
++ * Samsung's zinitix_zt75xx_ts.c (TOUCH_POINT_MODE 0, 5 fingers).
++ * Reported through sweet_hid_touch(finger, down, x, y) in panel pixels.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++int a40_touch_init(void);
++
++#define TOP_PINCTRL     0x139B0000UL
++#define GPP4            0x0A0
++#define GPG2            0x160
++#define ALIVE_GPA0      0x11CB0040UL
++#define I2C4            0x13870000UL
++#define ZT_ADDR         0x20
++
++#define IICCON          0x00
++#define IICSTAT         0x04
++#define IICDS           0x0C
++#define IICLC           0x10
++#define CON_ACK         (1u << 7)
++#define CON_CLK512      (1u << 6)
++#define CON_IRQEN       (1u << 5)
++#define CON_PEND        (1u << 4)
++
++static vm_offset_t top, gpa0, i2c;
++static int a40_touch_chan;
++uint32_t a40_touch_diag[4];
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
++
++static void
++sleep_ms(uint32_t ms)
++{
++	assert_wait_timeout((event_t)&a40_touch_chan, THREAD_UNINT, ms, NSEC_PER_MSEC);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++i2c_wait_pend(void)
++{
++	for (int i = 0; i < 20000; i++) {       /* ~ 20 ms */
++		if (rd(i2c, IICCON) & CON_PEND) {
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++static void
++i2c_resume(uint32_t ack)
++{
++	uint32_t c = rd(i2c, IICCON) & ~(CON_PEND | CON_ACK);
++	wr(i2c, IICCON, c | (ack ? CON_ACK : 0));
++}
++
++static void
++i2c_stop(uint32_t mode)
++{
++	wr(i2c, IICSTAT, mode);                 /* BUSY=0: STOP */
++	i2c_resume(1);
++	for (int i = 0; i < 2000 && (rd(i2c, IICSTAT) & (1u << 5)); i++) {
++		delay(1);
++	}
++}
++
++/* write len bytes (first two = register, little endian) */
++static int
++i2c_write(const uint8_t *b, int len)
++{
++	wr(i2c, IICSTAT, 0xD0);                 /* master Tx, output enable */
++	wr(i2c, IICDS, ZT_ADDR << 1);
++	wr(i2c, IICSTAT, 0xF0);                 /* START */
++	if (i2c_wait_pend() || (rd(i2c, IICSTAT) & 1)) {
++		a40_touch_diag[0] = rd(i2c, IICSTAT) | 0x100;
++		i2c_stop(0xD0);
++		return -1;
++	}
++	for (int i = 0; i < len; i++) {
++		wr(i2c, IICDS, b[i]);
++		i2c_resume(1);
++		if (i2c_wait_pend() || (rd(i2c, IICSTAT) & 1)) {
++			a40_touch_diag[1] = rd(i2c, IICSTAT) | (i << 16);
++			i2c_stop(0xD0);
++			return -1;
++		}
++	}
++	i2c_stop(0xD0);
++	return 0;
++}
++
++static int
++i2c_read(uint8_t *b, int len)
++{
++	wr(i2c, IICSTAT, 0x90);                 /* master Rx */
++	wr(i2c, IICDS, (ZT_ADDR << 1) | 1);
++	wr(i2c, IICSTAT, 0xB0);                 /* START */
++	if (i2c_wait_pend() || (rd(i2c, IICSTAT) & 1)) {
++		a40_touch_diag[2] = rd(i2c, IICSTAT) | 0x100;
++		i2c_stop(0x90);
++		return -1;
++	}
++	for (int i = 0; i < len; i++) {
++		i2c_resume(i < len - 1);        /* NACK the last byte */
++		if (i2c_wait_pend()) {
++			i2c_stop(0x90);
++			return -1;
++		}
++		b[i] = (uint8_t)rd(i2c, IICDS);
++	}
++	i2c_stop(0x90);
++	return 0;
++}
++
++static int
++zt_cmd(uint16_t reg)
++{
++	uint8_t b[2] = { (uint8_t)reg, (uint8_t)(reg >> 8) };
++	return i2c_write(b, 2);
++}
++
++static int
++zt_wr(uint16_t reg, uint16_t v)
++{
++	uint8_t b[4] = { (uint8_t)reg, (uint8_t)(reg >> 8), (uint8_t)v, (uint8_t)(v >> 8) };
++	return i2c_write(b, 4);
++}
++
++static int
++zt_rd(uint16_t reg, uint8_t *out, int len)
++{
++	if (zt_cmd(reg)) {
++		return -1;
++	}
++	delay(50);
++	return i2c_read(out, len);
++}
++
++static bool
++zt_power_on(void)
++{
++	uint16_t chip = 0;
++	for (int retry = 0; retry < 4; retry++) {
++		if (zt_wr(0xc000, 1) == 0) {                    /* vendor command enable */
++			delay(10);
++			zt_rd(0xcc00, (uint8_t *)&chip, 2);
++			delay(10);
++			if (zt_cmd(0xc004) == 0 &&              /* INT clear */
++			    zt_wr(0xc002, 1) == 0) {            /* NVM init */
++				delay(2000);
++				if (zt_wr(0xc001, 1) == 0) {    /* program start */
++					sleep_ms(150);
++					printf("A40 TOUCH: chip code %#x\n", chip);
++					return true;
++				}
++			}
++		}
++		sleep_ms(50);
++	}
++	return false;
++}
++
++static bool
++zt_init(void)
++{
++	uint8_t nodes[4] = { 0 };
++	zt_rd(0x0060, nodes, 4);                        /* TOTAL_NUMBER_OF_X/Y, informative */
++	if (zt_cmd(0x0000) ||                           /* SWRESET */
++	    zt_wr(0x0010, 0) ||                         /* TOUCH_MODE = point mode */
++	    zt_wr(0x0023, 0)) {                         /* COVER_CONTROL = open (best effort) */
++		return false;
++	}
++	for (int i = 0; i < 10; i++) {
++		zt_cmd(0x0003);                         /* clear INT, discard garbage */
++		delay(10);
++	}
++	printf("A40 TOUCH: ready, %u x %u nodes\n", nodes[0] | nodes[1] << 8, nodes[2] | nodes[3] << 8);
++	return true;
++}
++
++static void
++a40_touch_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	uint8_t down[5] = { 0 };
++	uint16_t lx[5] = { 0 }, ly[5] = { 0 };
++
++	/* I2C4 clock: CMU_PERI gate (manual, on) + Q-channel clock request (cmucal-sfr.c 7885) */
++	vm_offset_t cmu = ml_io_map(0x10010000, 0x4000);
++	uint32_t g0 = rd(cmu, 0x2048), q0 = rd(cmu, 0x3028);
++	wr(cmu, 0x2048, (g0 & ~(1u << 28)) | (1u << 20) | (1u << 21));
++	wr(cmu, 0x3028, q0 | (1u << 1));
++	printf("A40 TOUCH: i2c4 gate %#x -> %#x, qch %#x -> %#x\n", g0, rd(cmu, 0x2048), q0, rd(cmu, 0x3028));
++	/* tsp_avdd on (gpg2-1 output high), I2C pins (gpp4-0/1 function 2) */
++	uint32_t con = rd(top, GPG2);
++	wr(top, GPG2, (con & ~(0xfu << 4)) | (1u << 4));
++	wr(top, GPG2 + 4, rd(top, GPG2 + 4) | (1u << 1));
++	con = rd(top, GPP4);
++	wr(top, GPP4, (con & ~0xffu) | 0x22);
++	/* I2C: PCLK/512, prescaler 15 (slow but safe), ACK. IRQEN must be set or the
++	 * pending flag (IICCON[4]) does not work (Samsung UM); the GIC line stays off. */
++	wr(i2c, IICCON, CON_ACK | CON_CLK512 | CON_IRQEN | 0xf);
++	wr(i2c, IICLC, 0x4);                            /* filter on, SDA delay 0 */
++	sleep_ms(100);
++	printf("A40 TOUCH: after setup gpg2 %#x/%#x gpp4 %#x i2c con %#x stat %#x\n",
++	    rd(top, GPG2), rd(top, GPG2 + 4), rd(top, GPP4), rd(i2c, IICCON), rd(i2c, IICSTAT));
++	if (!zt_power_on() || !zt_init()) {
++		printf("A40 TOUCH: controller not responding (diag %#x %#x %#x), touch disabled\n",
++		    a40_touch_diag[0], a40_touch_diag[1], a40_touch_diag[2]);
++		return;
++	}
++	for (;;) {
++		if (rd(gpa0, 4) & 1) {                  /* attention high: nothing new */
++			sleep_ms(8);
++			continue;
++		}
++		uint8_t p[4 + 5 * 6];
++		if (zt_rd(0x0080, p, sizeof(p)) == 0) {
++			uint16_t status = p[0] | p[1] << 8;
++			if (status != 0xffff && !(status & (1u << 13))) {
++				for (int f = 0; f < 5; f++) {
++					const uint8_t *c = p + 4 + 6 * f;
++					uint16_t x = c[0] | c[1] << 8, y = c[2] | c[3] << 8;
++					uint8_t sub = c[5];
++					int now = (sub & 1) && !(sub & (1u << 3));
++					if (now && (!down[f] || x != lx[f] || y != ly[f])) {
++						down[f] = 1;
++						lx[f] = x;
++						ly[f] = y;
++						sweet_hid_touch(f, 1, x, y);
++					} else if (!now && down[f]) {
++						down[f] = 0;
++						sweet_hid_touch(f, 0, lx[f], ly[f]);
++					}
++				}
++			}
++		}
++		zt_cmd(0x0003);                         /* clear INT */
++		sleep_ms(4);
++	}
++}
++
++int
++a40_touch_init(void)
++{
++	DTEntry node;
++	thread_t th;
++
++	if (SecureDTLookupEntry(NULL, "/a40-touch", &node) != kSuccess) {
++		extern int a40_platform(void);
++		return a40_platform();
++	}
++	top = ml_io_map(TOP_PINCTRL, 0x1000);
++	gpa0 = ml_io_map(ALIVE_GPA0 & ~0xfffUL, 0x1000) + (ALIVE_GPA0 & 0xfff);
++	i2c = ml_io_map(I2C4, 0x1000);
++	printf("A40 TOUCH: gpg2 con %#x dat %#x gpp4 con %#x i2c con %#x stat %#x\n",
++	    rd(top, GPG2), rd(top, GPG2 + 4), rd(top, GPP4), rd(i2c, IICCON), rd(i2c, IICSTAT));
++	if (kernel_thread_start(a40_touch_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	return 1;
++}
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..6631232 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -131,6 +131,12 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_started = true;
++	{
++		extern int a40_keys_init(void);
++		if (a40_keys_init()) {
++			return;
++		}
++	}
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..1bdcac0 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -644,6 +644,12 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
++	{
++		extern int a40_touch_init(void);
++		if (a40_touch_init()) {
++			return;
++		}
++	}
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..53e5095 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -114,6 +114,12 @@ static struct {
+ 	bool ready;
+ } su;
+ 
++/* A40: eMMC (dw_mmc) or QEMU virtio-blk backend, bsd/dev/a40_blk.c */
++static bool su_a40;
++extern int a40_blk_probe(vm_offset_t bounce, uint64_t bounce_pa, uint32_t bounce_size);
++extern int a40_blk_read(uint64_t blk4k, uint32_t count);
++extern int a40_blk_write(uint64_t blk4k, uint32_t count);
++
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
+@@ -263,6 +269,9 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
++	if (su_a40) {
++		return a40_blk_read(lba, count);
++	}
+ 	uint8_t cdb[10] = {
+ 		0x28, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -284,6 +293,9 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++	if (su_a40) {
++		return a40_blk_write(lba, count);
++	}
+ 	uint8_t cdb[10] = {
+ 		0x2a, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -295,6 +307,9 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ static int
+ ufs_sync_cache(void)
+ {
++	if (su_a40) {
++		return 0;       /* eMMC cache stays off (S-Boot default); virtio writes through */
++	}
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+@@ -303,10 +318,15 @@ static int
+ ufs_find_partition(const char *want)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+-	int error = ufs_read_blocks(1, 1);
++	/* A40 eMMC / virtio: 512-byte sectors, GPT header at byte 512 */
++	uint32_t sec = su_a40 ? 512u : UFS_BLOCK;
++	int error = su_a40 ? ufs_read_blocks(0, 1) : ufs_read_blocks(1, 1);
+ 	if (error) {
+ 		return error;
+ 	}
++	if (su_a40) {
++		b += 512;
++	}
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+ 		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
+ 		return ENXIO;
+@@ -320,7 +340,15 @@ ufs_find_partition(const char *want)
+ 		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+ 		return ENXIO;
+ 	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	if (su_a40) {
++		/* entries start at a 512-byte sector: read the 4 KiB blocks around them */
++		uint64_t byte = entry_lba * sec;
++		error = ufs_read_blocks(byte / UFS_BLOCK, (uint32_t)((byte % UFS_BLOCK + nent * esz + UFS_BLOCK - 1) / UFS_BLOCK));
++		b += byte % UFS_BLOCK;
++	} else {
++		error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	}
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -345,6 +373,16 @@ ufs_find_partition(const char *want)
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
++		if (su_a40) {
++			/* sectors -> 4 KiB blocks; the partition must start 4 KiB aligned */
++			if (first % (UFS_BLOCK / sec)) {
++				printf("SWEET UFS: partition \"%s\" starts at unaligned sector 0x%llx\n", want, first);
++				return ENXIO;
++			}
++			su.first_block = first / (UFS_BLOCK / sec);
++			su.nblocks = (last - first + 1) / (UFS_BLOCK / sec);
++			return 0;
++		}
+ 		su.first_block = first;
+ 		su.nblocks = last - first + 1;
+ 		return 0;
+@@ -592,9 +630,11 @@ sweet_ufs_init(void)
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	bool a40_node = SecureDTLookupEntry(NULL, "/a40-mmc", &node) == kSuccess ||
++	    SecureDTLookupEntry(NULL, "/a40-virtio", &node) == kSuccess;
++	if (!a40_node && (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+-	    size < 2 * sizeof(uintptr_t)) {
++	    size < 2 * sizeof(uintptr_t))) {
+ 		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
+ 		return ENXIO;
+ 	}
+@@ -607,7 +647,9 @@ sweet_ufs_init(void)
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+ 
+-	su.regs = ml_io_map(reg[0], reg[1]);
++	if (!a40_node) {
++		su.regs = ml_io_map(reg[0], reg[1]);
++	}
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+@@ -622,6 +664,14 @@ sweet_ufs_init(void)
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
++	if (a40_node) {
++		error = a40_blk_probe(su.dma + DMA_BOUNCE, su.dma_pa + DMA_BOUNCE, BOUNCE_SIZE);
++		su_a40 = (error == 0);
++		if (!error) {
++			error = ufs_find_partition(want);
++		}
++		goto probed;
++	}
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+@@ -632,6 +682,7 @@ sweet_ufs_init(void)
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++probed:
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..d2f81be 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6884,6 +6884,17 @@ load_init_program(proc_t p)
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
+ 
++#if defined(SWEET)
++	/* A40: a40mgreset=1 drops the MobileGestalt cache (screen size/scale changed). */
++	int a40mg = 0;
++	if (PE_parse_boot_argn("a40mgreset", &a40mg, sizeof(a40mg)) && a40mg) {
++		extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
++		static const char mg[] = "/private/var/containers/Shared/SystemGroup/"
++		    "systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
++		int e = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(mg), UIO_SYSSPACE, 0);
++		printf("A40: MobileGestalt cache reset: %d\n", e);
++	}
++#endif
+ #if DEBUG || DEVELOPMENT
+ 	/* Check for boot-arg suffix first */
+ 	char launchd_suffix[64];
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..6114e30 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -7,6 +7,7 @@
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOCPU.h>
++#include <pexpert/arm/protos.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSNumber.h>
+@@ -17,6 +18,8 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <machine/machine_routines.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -58,6 +61,8 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetCPU, IOCPU);
+ 
++static uint32_t a40_cpu_diag[4];         /* A40: PSCI rc, PMU cfg, PMU status at power-on */
++
+ bool
+ SweetCPU::start(IOService *provider)
+ {
+@@ -73,8 +78,11 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/* sweet: MPIDR Aff1 = core (0x000-0x500 A55, 0x600/0x700 A76);
++	 * A40: Aff0 = core in the A73 cluster (0x0, 0x1). */
++	bool sweet_ok = cpu->phys_id <= 0x700 && (cpu->phys_id & 0xff) == 0;
++	bool a40_ok = cpu->phys_id <= 0x1;
++	if (!(sweet_ok || a40_ok) ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -161,7 +169,11 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI) init=%u sgi=%d "
++				    "A40 psci rc %d pmu cfg %#x st %#x",
++				    i, __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++				    sweet_cpu_signal_is_enabled(i), (int)a40_cpu_diag[0],
++				    a40_cpu_diag[1], a40_cpu_diag[2]);
+ 			}
+ 			IOSleep(1);
+ 		}
+@@ -214,6 +226,10 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("SWEET CPU: invalid SGI target %u", logical);
+ 	}
++	if (pe_gic_send_sgi_v2(logical, SWEET_IPI_SGI)) {
++		__builtin_arm_isb(ISB_SY);
++		return;
++	}
+ 	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+ 	uint64_t mpidr = topology->cpus[logical].phys_id;
+ 	unsigned int aff0 = mpidr & 0xff;
+@@ -229,6 +245,36 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	__builtin_arm_isb(ISB_SY);
+ }
+ 
++/*
++ * Galaxy A40 (Exynos 7904): the secure monitor only records the entry point;
++ * the core is powered by the PMU like Samsung's PMUCAL does
++ * (pmucal_cpu_exynos7885.h, cluster 0 = Cortex-A73, MPIDR Aff1 0).
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static void
++a40_pmu_core_on(uint32_t mpidr)
++{
++	DTEntry node;
++	if (SecureDTLookupEntry(NULL, "/a40-mmc", &node) != kSuccess || ((mpidr >> 8) & 0xff) != 0) {
++		return;
++	}
++	static vm_offset_t pmu, shortstop;
++	if (!pmu) {
++		pmu = ml_io_map(0x11C80000, 0x4000);
++		shortstop = ml_io_map(0x10900000, 0x1000);
++	}
++	volatile uint32_t *seq = (volatile uint32_t *)(pmu + 0x2488);
++	volatile uint32_t *cfg = (volatile uint32_t *)(pmu + 0x2000 + (mpidr & 0xff) * 0x80);
++	*(volatile uint32_t *)(shortstop + 0x820) = 0xFFFFFFFF;
++	*seq = (*seq & ~1u) | (1u << 4);
++	*cfg = *cfg | 0xF;
++	__builtin_arm_dsb(DSB_SY);
++	a40_cpu_diag[1] = cfg[0];
++	a40_cpu_diag[2] = cfg[1];
++	IOLog("SWEET CPU: A40 PMU core 0x%x cfg %#x status %#x\n", mpidr, cfg[0], cfg[1]);
++}
++
+ kern_return_t
+ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+@@ -241,9 +287,21 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
++	/* A40: the secure monitor drops the high bits of the entry point; go through
++	 * the loader's trampoline below 4 GiB (a40sec=, target quad at +16). */
++	uint64_t a40sec = 0;
++	if (PE_parse_boot_argn("a40sec", &a40sec, sizeof(a40sec)) && a40sec) {
++		vm_offset_t t = ml_io_map(a40sec & ~0x3fffULL, 0x4000) + (a40sec & 0x3fff);
++		*(volatile uint64_t *)(t + 16) = entry;
++		__builtin_arm_dsb(DSB_SY);
++		IOLog("SWEET CPU: A40 trampoline %#llx -> %#llx\n", a40sec, (uint64_t)entry);
++		entry = (vm_offset_t)a40sec;
++	}
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
++	a40_cpu_diag[0] = (uint32_t)rc;
++	a40_pmu_core_on(cpu->phys_id);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+ 		panic("SWEET CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..d8a7f5a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -43,6 +43,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
++extern "C" void sweet_display_kick(void);
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+@@ -103,6 +104,8 @@ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
++	bool          fScaled;                  /* A40: logical size scaled to the full panel */
++	uint16_t     *fXMap;                    /* panel x -> logical x (scaled mode) */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -122,6 +125,8 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
++	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -174,8 +179,26 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+-	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/* A40: sweetfb_lw/sweetfb_lh present a smaller display (e.g. 828x1792 @2x)
++	 * that is scaled (nearest) to the whole panel: fewer pixels to render on the CPU. */
++	uint32_t lw = 0, lh = 0;
++	PE_parse_boot_argn("sweetfb_lw", &lw, sizeof(lw));
++	PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh));
++	fScaled = false;
++	fXMap = NULL;
++	if (lw >= 320 && lh >= 480 && lw <= fWidth && lh <= fHeight) {
++		fXMap = (uint16_t *)IOMalloc(fWidth * sizeof(uint16_t));
++		if (fXMap != NULL) {
++			for (uint32_t x = 0; x < fWidth; x++) {
++				fXMap[x] = (uint16_t)((uint64_t)x * lw / fWidth);
++			}
++			fLogicalW = lw;
++			fLogicalH = lh;
++			fScaled = true;
++		}
++	}
++	fOffX = fScaled ? 0 : (int32_t)(fLogicalW - fWidth) / 2;
++	fOffY = fScaled ? 0 : (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -349,6 +372,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (fScaled) {
++			presentScaled(s, src, bpe, sx, sy, dx, dy, w, h);
++			s->release();
++			continue;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+@@ -399,6 +427,70 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	sweet_display_kick();
++}
++
++/* A40 scaled mode: layer rect in logical coordinates -> nearest-neighbour fill of the panel. */
++void
++AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
++    int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	if (src == 0 || bpe != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->memory == NULL) {
++		return;
++	}
++	if (w <= 0 || h <= 0) {
++		w = (int32_t)s->width;
++		h = (int32_t)s->height;
++	}
++	if (sx < 0 || sy < 0) {
++		sx = sy = 0;
++	}
++	if (dx < 0 || dy < 0) {
++		dx = dy = 0;
++	}
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (w > (int32_t)fLogicalW - dx) {
++		w = (int32_t)fLogicalW - dx;
++	}
++	if (h > (int32_t)fLogicalH - dy) {
++		h = (int32_t)fLogicalH - dy;
++	}
++	if (w <= 0 || h <= 0) {
++		return;
++	}
++	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4;
++	if (last > s->memory->getLength()) {
++		return;
++	}
++	/* panel span covered by [dx, dx+w) x [dy, dy+h) */
++	uint32_t px0 = (uint32_t)(((uint64_t)dx * fWidth + fLogicalW - 1) / fLogicalW);
++	uint32_t px1 = (uint32_t)(((uint64_t)(dx + w) * fWidth + fLogicalW - 1) / fLogicalW);
++	uint32_t py0 = (uint32_t)(((uint64_t)dy * fHeight + fLogicalH - 1) / fLogicalH);
++	uint32_t py1 = (uint32_t)(((uint64_t)(dy + h) * fHeight + fLogicalH - 1) / fLogicalH);
++	px1 = MIN(px1, fWidth);
++	py1 = MIN(py1, fHeight);
++	const uint8_t *base = (const uint8_t *)(src + s->offset);
++	int32_t prev_ly = -1;
++	uint32_t *prev_row = NULL;
++	for (uint32_t py = py0; py < py1; py++) {
++		int32_t ly = (int32_t)((uint64_t)py * fLogicalH / fHeight);
++		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++		if (ly == prev_ly && prev_row != NULL) {
++			memcpy(drow + px0, prev_row + px0, (size_t)(px1 - px0) * 4);
++			continue;
++		}
++		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly - dy) * s->bytesPerRow) + sx - dx;
++		for (uint32_t px = px0; px < px1; px++) {
++			drow[px] = srow[fXMap[px]];
++		}
++		prev_ly = ly;
++		prev_row = drow;
++	}
+ }
+ 
+ bool
+@@ -516,7 +608,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH;
++		out[0] = fFB->fScaled ? 326 : SWEET_FB_DOT_PITCH;   /* 828x1792 @2x: iPhone XR density */
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications:
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..83381a0 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -434,10 +434,19 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fLogicalW = native ? SWEET_FB_W : 1125;
++	fLogicalH = native ? SWEET_FB_H : 2436;
++	fOffX = (fLogicalW - SWEET_FB_W) / 2;
++	fOffY = (fLogicalH - SWEET_FB_H) / 2;
++	uint32_t lw = 0, lh = 0;
++	PE_parse_boot_argn("sweetfb_lw", &lw, sizeof(lw));
++	PE_parse_boot_argn("sweetfb_lh", &lh, sizeof(lh));
++	if (lw >= 320 && lh >= 480 && lw <= SWEET_FB_W && lh <= SWEET_FB_H) {
++		/* A40 scaled display: the panel shows the whole logical screen. */
++		fLogicalW = SWEET_FB_W;
++		fLogicalH = SWEET_FB_H;
++		fOffX = fOffY = 0;
++	}
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -459,7 +468,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	y = y < 0 ? 0 : (y > SWEET_FB_H - 1 ? SWEET_FB_H - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -473,7 +482,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	}
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_FB_H - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 69b13f9..37da426 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -61,7 +61,7 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto -mcpu=cortex-a73
+ 
+ 
+ #
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+index da0bbba..5130d79 100644
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -273,7 +273,16 @@ _pfz_trylock_and_enqueue:
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+ 	// Try to grab the lock
+-	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
++	/* A40 (ARMv8.0, no LSE): CAS w10 -> w11 as an exclusive pair */
++La40_enq_retry:
++	ldaxr	w10, [x3]
++	cbnz	w10, La40_enq_fail
++	stxr	w12, w11, [x3]
++	cbnz	w12, La40_enq_retry
++	b	La40_enq_done
++La40_enq_fail:
++	clrex
++La40_enq_done:
+ 	cbz		w10, Ltrylock_enqueue_success
+ 
+ 	mov		x0, #-1			// Failed
+@@ -323,7 +332,16 @@ _pfz_trylock_and_dequeue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+-	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
++	/* A40 (ARMv8.0, no LSE): CAS w10 -> w11 as an exclusive pair */
++La40_deq_retry:
++	ldaxr	w10, [x2]
++	cbnz	w10, La40_deq_fail
++	stxr	w12, w11, [x2]
++	cbnz	w12, La40_deq_retry
++	b	La40_deq_done
++La40_deq_fail:
++	clrex
++La40_deq_done:
+ 	cbz		w10, Ltrylock_dequeue_success
+ 
+ 	mov		x0, #-1			// Failed
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..29df9de 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1837,16 +1837,21 @@ static void
+ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+-	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
++	assert(va + 2 * ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = SWEET_FB_PHYS | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	/* A40: DECON software trigger, Device memory, next slot */
++	assert(slot[1] == ARM_TTE_EMPTY);
++	slot[1] = SWEET_DECON_PHYS | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
++	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index e01c124..6d911fb 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -651,12 +651,20 @@
+ #define SCTLR_JOP_KEYS_DEFAULT  0
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !__ARM_PAN_AVAILABLE__
++/* A40 (A73, ARMv8.0): no PAN, SPAN is RES1. Under QEMU's cortex-a76 it keeps
++ * exceptions from setting PSTATE.PAN, which this kernel never clears. */
++#define SCTLR_A40_SPAN          SCTLR_PAN_UNCHANGED
++#else
++#define SCTLR_A40_SPAN          0
++#endif
++
+ #define SCTLR_EL1_DEFAULT \
+ 	(SCTLR_RESERVED | SCTLR_UCI_ENABLED | SCTLR_nTWE_WFE_ENABLED | SCTLR_DZE_ENABLED | \
+ 	 SCTLR_I_ENABLED | SCTLR_SED_DISABLED | SCTLR_CP15BEN_ENABLED |                    \
+ 	 SCTLR_SA0_ENABLED | SCTLR_SA_ENABLED | SCTLR_C_ENABLED | SCTLR_M_ENABLED |        \
+ 	 SCTLR_CSEH_DEFAULT | SCTLR_DSSBS_DEFAULT |                                        \
+-	 SCTLR_ROP_KEYS_DEFAULT | SCTLR_JOP_KEYS_DEFAULT)
++	 SCTLR_ROP_KEYS_DEFAULT | SCTLR_JOP_KEYS_DEFAULT | SCTLR_A40_SPAN)
+ 
+ /*
+  * Coprocessor Access Control Register (CPACR)
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..457488d 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1861,8 +1861,8 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
+-	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+-	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	uint32_t iar = pe_gic_ack();
++	uint32_t intid = sweet_gic_v2 ? (iar & 0x3FF) : (iar & 0xFFFFFF);
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+@@ -1873,11 +1873,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		pe_gic_eoi(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		pe_gic_eoi(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1888,7 +1888,7 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		pe_gic_eoi(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..f51cc75 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -289,6 +289,18 @@ LEXT(bootstrap_instructions)
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
+ 	msr		DAIFSet, #0xf
++	/* A40 diag: white band (rows 2200-2219) as the very first sign of life, MMU off */
++	MOV64	x1, (SWEET_FB_PHYS + 2200 * SWEET_FB_STRIDE)
++	MOV64	x2, (20 * SWEET_FB_STRIDE / 4)
++	mov		w3, #-1
++1:	str		w3, [x1], #4
++	subs	x2, x2, #1
++	b.ne	1b
++	dsb		sy
++	MOV64	x1, (SWEET_DECON_PHYS + SWEET_DECON_TRIG_OFF)
++	mov		w3, #SWEET_DECON_TRIG_VAL
++	str		w3, [x1]
++	dsb		sy
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+@@ -515,7 +527,7 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (SWEET_FB_PHYS + 2300 * SWEET_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+ 	mov		x4, #4320
+@@ -530,6 +542,10 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++	MOV64	x0, (SWEET_DECON_PHYS + SWEET_DECON_TRIG_OFF)
++	mov		w1, #SWEET_DECON_TRIG_VAL
++	str		w1, [x0]
++	dsb		sy
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -686,13 +702,20 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, SWEET_FB_PHYS
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	/* A40: DECON (software trigger) as Device memory, V=P */
++	MOV64	x10, SWEET_DECON_PHYS
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..3752157 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,13 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_FB_PHYS;
++static volatile uint32_t *early_trig = (volatile uint32_t *)(uintptr_t)(SWEET_DECON_PHYS + SWEET_DECON_TRIG_OFF);
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH ((unsigned)SWEET_FB_W)
++#define EARLY_HEIGHT ((unsigned)SWEET_FB_H)
++#define EARLY_STRIDE ((unsigned)SWEET_FB_STRIDE / 4)
++#define EARLY_KICK() do { __asm__ volatile("dsb sy" ::: "memory"); *early_trig = SWEET_DECON_TRIG_VAL; } while (0)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -54,6 +56,7 @@ sweet_early_putc(char c)
+ 		return;
+ 	}
+ 	if (c == '\n' || early_col == EARLY_COLS) {
++		EARLY_KICK();
+ 		early_col = 0;
+ 		early_row = (early_row + 1) % EARLY_ROWS;
+ 		sweet_early_clear_row();
+@@ -122,7 +125,7 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	_doprnt(fmt, &copy, sweet_early_putc, 16);
+ 	va_end(copy);
+ 	sweet_early_putc('\n');
+-	__asm__ volatile("dsb sy" ::: "memory");
++	EARLY_KICK();
+ }
+ 
+ void
+@@ -130,6 +133,8 @@ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+ 	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	/* arm_vm_init maps the DECON block in the next 32 MB L2 slot */
++	early_trig = (volatile uint32_t *)(uintptr_t)(base + ARM_TT_L2_SIZE + SWEET_DECON_TRIG_OFF);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..e9379c4 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -26,6 +26,28 @@ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
+ static vm_offset_t gicr_size;
+ 
++#if defined(SWEET)
++/*
++ * A40 (Exynos 7904): GIC-400 = GICv2, memory-mapped CPU interface, no
++ * system registers. Selected at runtime from /arm-io/gic compatible
++ * "arm,gic-400" (QEMU virt gic-version=2 uses the same tree), so one
++ * kernel boots both the phone and the emulator.
++ */
++SECURITY_READ_ONLY_LATE(int) sweet_gic_v2 = 0;
++static vm_offset_t gicc_base;
++static uint8_t gicv2_cpu_mask[MAX_CPUS];
++#define GICD_ISENABLER0_V2      0x100
++#define GICD_IGROUPR0_V2        0x080
++#define GICD_IPRIORITYR0_V2     0x400
++#define GICD_ITARGETSR0_V2      0x800
++#define GICD_SGIR_V2            0xF00
++#define GICC_CTLR_V2            0x00
++#define GICC_PMR_V2             0x04
++#define GICC_BPR_V2             0x08
++#define GICC_IAR_V2             0x0C
++#define GICC_EOIR_V2            0x10
++#endif
++
+ static uint32_t
+ _gic_read32(vm_offset_t addr)
+ {
+@@ -50,6 +72,72 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++#if defined(SWEET)
++uint32_t
++pe_gic_ack(void)
++{
++	if (sweet_gic_v2) {
++		return _gic_read32(gicc_base + GICC_IAR_V2);
++	}
++	return (uint32_t)__builtin_arm_rsr64("ICC_IAR1_EL1");
++}
++
++void
++pe_gic_eoi(uint32_t iar)
++{
++	if (sweet_gic_v2) {
++		_gic_write32(gicc_base + GICC_EOIR_V2, iar);
++		return;
++	}
++	__builtin_arm_wsr64("ICC_EOIR1_EL1", (uint64_t)iar);
++}
++
++/* Returns 1 when sent through the GICv2 distributor; 0: caller uses ICC_SGI1R_EL1. */
++int
++pe_gic_send_sgi_v2(unsigned int logical_cpu, unsigned int sgi)
++{
++	if (!sweet_gic_v2) {
++		return 0;
++	}
++	uint32_t mask = logical_cpu < MAX_CPUS ? gicv2_cpu_mask[logical_cpu] : 0;
++	if (!mask) {
++		panic("A40 GIC: no GICv2 CPU interface mask for cpu %u", logical_cpu);
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	gicd_write32(GICD_SGIR_V2, (mask << 16) | (sgi & 0xF));
++	return 1;
++}
++
++static void
++pe_init_fiq_v2(void)
++{
++	/* ITARGETSR0..7 are banked and read back this CPU interface's own bit. */
++	uint32_t m = gicd_read32(GICD_ITARGETSR0_V2) & 0xFF;
++	if (!m) {
++		m = (gicd_read32(GICD_ITARGETSR0_V2 + 0x1C) >> 24) & 0xFF;
++	}
++	if (!m) {
++		m = 1;          /* uniprocessor GIC: ITARGETSR is RAZ, one interface */
++	}
++	unsigned int cpu = ml_get_cpu_number_local();
++	if (cpu < MAX_CPUS) {
++		gicv2_cpu_mask[cpu] = (uint8_t)m;
++	}
++	gicd_write32(GICD_IGROUPR0_V2, 0xFFFFFFFF);     /* NS: WI if TrustZone owns grouping */
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICD_IPRIORITYR0_V2 + i, 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ISENABLER0_V2, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	_gic_write32(gicc_base + GICC_PMR_V2, 0xF0);
++	_gic_write32(gicc_base + GICC_BPR_V2, 0);
++	_gic_write32(gicc_base + GICC_CTLR_V2, _gic_read32(gicc_base + GICC_CTLR_V2) | 0x7);   /* NS view: bit0 = Grp1; no security ext: Grp0|Grp1|AckCtl */
++	gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | 0x3);
++	__builtin_arm_isb(ISB_SY);
++	kprintf("A40 GIC: GICv2 cpu %u interface mask 0x%x ctlr 0x%x\n", cpu, m,
++	    _gic_read32(gicc_base + GICC_CTLR_V2));
++}
++#endif /* SWEET */
++
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
+@@ -117,6 +205,14 @@ pe_init_fiq()
+ 			sweet_vtimer_intid = intid;
+ 		}
+ 		kprintf("SWEET GIC: virtual timer INTID %u\n", sweet_vtimer_intid);
++		{
++			void const *cp;
++			unsigned int cs;
++			if (SecureDTGetProperty(entry, "compatible", &cp, &cs) == kSuccess &&
++			    cs >= 11 && strncmp((const char *)cp, "arm,gic-400", 11) == 0) {
++				sweet_gic_v2 = 1;
++			}
++		}
+ #endif
+ 
+ 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
+@@ -133,6 +229,16 @@ pe_init_fiq()
+ 			panic("%s: cannot map GICD region", __func__);
+ 		}
+ 
++#if defined(SWEET)
++		if (sweet_gic_v2) {
++			/* GICv2: second reg pair is the CPU interface */
++			gicc_base = ml_io_map(soc_base_phys + gicr_base_prop, gicr_size_prop);
++			if (!gicc_base) {
++				panic("%s: cannot map GICC region", __func__);
++			}
++			goto gic_mapped;
++		}
++#endif
+ 		// Find GICR base address
+ 		gicr_base = ml_io_map(soc_base_phys + gicr_base_prop, gicr_size_prop);
+ 
+@@ -141,8 +247,19 @@ pe_init_fiq()
+ 		}
+ 
+ 		gicr_size = gicr_size_prop;
++#if defined(SWEET)
++gic_mapped:
++		;
++#endif
+ 	}
+ 
++#if defined(SWEET)
++	if (sweet_gic_v2) {
++		pe_init_fiq_v2();
++		return;
++	}
++#endif
++
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+ 
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..9cdaf06 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -719,6 +719,19 @@ extern unsigned char iso_font[256 * 16];
+ 
+ static volatile uint32_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++/* A40: command-mode panel, DECON needs a software trigger after updates (ADT "trigger" = <u64 phys, u32 value>) */
++static volatile uint32_t *fbcon_trig;
++static uint32_t fbcon_trig_val;
++
++void sweet_display_kick(void);
++void
++sweet_display_kick(void)
++{
++	if (fbcon_trig) {
++		__builtin_arm_dsb(DSB_SY);
++		*fbcon_trig = fbcon_trig_val;
++	}
++}
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
+ static void
+@@ -735,6 +748,7 @@ fbcon_clear_row(uint32_t row)
+ static void
+ fbcon_newline(void)
+ {
++	sweet_display_kick();
+ 	fbcon_col = 0;
+ 	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+ 	fbcon_clear_row(fbcon_row);
+@@ -834,6 +848,19 @@ fbcon_probe(void)
+ 	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
+ 		return;
+ 	}
++	{
++		uint8_t const *t;
++		unsigned int tsz;
++		if (SecureDTGetProperty(entry, "trigger", (void const **)&t, &tsz) == kSuccess && tsz >= 12) {
++			uint64_t tpa;
++			memcpy(&tpa, t, 8);
++			memcpy(&fbcon_trig_val, t + 8, 4);
++			vm_offset_t page = ml_io_map(tpa & ~(uint64_t)PAGE_MASK, PAGE_SIZE);
++			if (page) {
++				fbcon_trig = (volatile uint32_t *)(page + (tpa & PAGE_MASK));
++			}
++		}
++	}
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+ 	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..bd7c615 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,10 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++extern int sweet_gic_v2;
++uint32_t pe_gic_ack(void);
++void pe_gic_eoi(uint32_t iar);
++int pe_gic_send_sgi_v2(unsigned int logical_cpu, unsigned int sgi);
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..b834ce7 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -33,7 +33,7 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-#define __ARM_PAN_AVAILABLE__     1
++/* A40: Cortex-A73 is ARMv8.0, no PAN */
+ #define __ARM_16K_PG__            1
+ 
+ #define HAS_GIC_V3                1
+@@ -48,6 +48,19 @@
+  * (CNTV) is INTID 16 + 3 = 19.
+  */
+ #define SWEET_VTIMER_INTID        19
++/*
++ * A40 (Galaxy A40, Exynos 7904) fork: splash framebuffer left by S-Boot and
++ * the DECON software trigger the command-mode panel needs after each update.
++ * QEMU (tools/qemu-a40.py) keeps the same addresses as plain RAM / ignored MMIO.
++ */
++#define SWEET_FB_PHYS             0xEC000000ULL
++#define SWEET_FB_W                1080
++#define SWEET_FB_H                2340
++#define SWEET_FB_STRIDE           4320
++#define SWEET_DECON_PHYS          0x14000000ULL   /* 32 MB block holding DECON (0x14860000) */
++#define SWEET_DECON_TRIG_OFF      0x860070
++#define SWEET_DECON_TRIG_VAL      0x1281
++
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
