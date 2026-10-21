@@ -4,6 +4,12 @@ Status: source comparison and offline groundwork only. No phone was accessed,
 no partition was written, and no A10 boot is established. There is no A10 boot
 image in this change. The XNU patch and prebuilt images remain A40 artifacts.
 
+Follow-up: the user's working device is SM-A105G according to Download Mode,
+with a replacement display pending. See [SM-A105G evidence preparation](sm-a105g-next-steps.md)
+for regional-source ambiguity and offline DTB/GPT inspection. In particular,
+the common SEC touchscreen definition below must not be treated as physical
+confirmation for every regional variant.
+
 ## Reproducible source baseline
 
 Inspected on 2026-10-21:

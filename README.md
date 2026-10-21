@@ -9,6 +9,11 @@ Host tooling now requires explicit A40 selection; A10 selection is rejected
 until a verified hardware profile exists. A stock boot header alone cannot
 validate the loader's RAM, framebuffer, PMU, or storage assumptions.
 
+The working device is **SM-A105G**, as reported from Download Mode; its display
+is currently unavailable. [SM-A105G evidence preparation](docs/sm-a105g-next-steps.md)
+documents regional touchscreen uncertainty and the new offline DTB/GPT inspection
+tools. These tools read saved files and do not access a phone or enable A10 builds.
+
 Run the offline checks with `bash tools/check-host.sh` (Python 3, a C compiler
 with AddressSanitizer/UBSan, and Git). These checks do not access a phone.
 

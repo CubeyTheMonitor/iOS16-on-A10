@@ -25,9 +25,10 @@ def entry():
 
 ents = entry().ljust(128, b'\0') + b'\0' * 128 * 127
 ecrc = zlib.crc32(ents)
+disk_guid = uuid.uuid4().bytes_le
 def hdr(my, alt, ent_lba):
     h = struct.pack('<8sIIIIQQQQ16sQIII', b'EFI PART', 0x10000, 92, 0, 0, my, alt, 34,
-                    total - 34, uuid.uuid4().bytes_le, ent_lba, 128, 128, ecrc)
+                    total - 34, disk_guid, ent_lba, 128, 128, ecrc)
     h = h[:16] + struct.pack('<I', zlib.crc32(h)) + h[20:]
     return h.ljust(SEC, b'\0')
 mbr = bytearray(SEC)
