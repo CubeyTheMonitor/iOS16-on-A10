@@ -6,6 +6,14 @@
 # Seul le clang de Xcode est nécessaire : pas de linker, le code « tiny » n'a aucune relocation.
 set -euo pipefail
 cd "$(dirname "$0")"
+if [ "${BOARD:-}" != a40 ]; then
+    echo 'Set BOARD=a40 to build the inherited A40 loader. A10 has no validated hardware profile.' >&2
+    exit 1
+fi
+if [ "$#" -ne 1 ]; then
+    echo 'Usage: BOARD=a40 PROG=loader16 BLOB=payload.bin ./build.sh A40-boot-backup.img' >&2
+    exit 1
+fi
 mkdir -p out
 PROG=${PROG:-payload}
 
@@ -29,4 +37,4 @@ sed -E -e 's/^[[:space:]]*\.section[[:space:]]+\.(rodata|data|bss)[^,]*(,.*)?$/	
 	-e 's/^[[:space:]]*\.comm[[:space:]]+([^,]+),([0-9]+),([0-9]+)$/	.text\n	.balign \3\n\1:\n	.zero \2/' out/$PROG.s > out/$PROG-flat.s
 clang -target aarch64-none-elf -c out/$PROG-flat.s -o out/$PROG.o
 
-python3 pack.py out/$PROG.o out/boot.img ${1:+--like "$1"} ${BLOB:+--blob "$BLOB"} ${RAMDISK:+--ramdisk "$RAMDISK"}
+python3 pack.py out/$PROG.o out/boot.img --board "$BOARD" --like "$1" ${BLOB:+--blob "$BLOB"} ${RAMDISK:+--ramdisk "$RAMDISK"}

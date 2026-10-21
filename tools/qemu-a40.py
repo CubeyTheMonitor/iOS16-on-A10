@@ -21,6 +21,7 @@ returns 2 when a panic is visible; absence of a panic does not prove boot.
 An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
+from payload_format import validate
 
 FB_BASE, FB_W, FB_H = 0xEC000000, 1080, 2340
 FB_STRIDE = FB_W * 4
@@ -76,6 +77,7 @@ def check_kernel_tools(kernel_path):
 
 def build_image(payload):
     """Return (phys_base, ram_image, boot_args_pa, entry_pa)."""
+    validate(payload)
     magic, ver, nsegs = struct.unpack_from('<8sII', payload, 0)
     assert magic == b'SWEETXNU' and ver == 1, 'not a SWEETXNU v1 payload'
     virt_base, entry_va, adt_off, adt_size, kernel_end, phys_base, mem_size = \
