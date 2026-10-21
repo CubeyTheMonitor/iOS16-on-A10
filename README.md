@@ -1,6 +1,19 @@
-this is a fork of the iOS16 on A40
+# A10 port investigation (SM-A105, Exynos 7884B)
 
-This will be A10 (exynos7884/7885) soon.
+**This repository does not yet contain a working A10 port. No A10 boot has been
+verified. The included boot images, hardware constants and installation guide
+below are inherited from the A40 project and must not be used on an A10.**
+
+See [the source comparison and remaining hardware work](docs/a10-porting.md).
+Host tooling now requires explicit A40 selection; A10 selection is rejected
+until a verified hardware profile exists. A stock boot header alone cannot
+validate the loader's RAM, framebuffer, PMU, or storage assumptions.
+
+Run the offline checks with `bash tools/check-host.sh` (Python 3, a C compiler
+with AddressSanitizer/UBSan, and Git). These checks do not access a phone.
+
+The sections below reproduce the upstream A40 instructions and claims. They
+are retained as reference, not as evidence of A10 compatibility.
 
 # iOS16 on A40
 
@@ -45,7 +58,7 @@ CPU clock: S-Boot leaves the A73s at 1352 MHz. Raising it needs the ACPM voltage
 
 2. **Put the phone in TWRP**, connect it, then write the root to userdata (≈ 15 min, every 256 MiB chunk is sha1-verified):
    ```bash
-   SERIAL=<your adb serial> tools/flash-userdata.sh root.img 0
+   BOARD=a40 SERIAL=<your adb serial> tools/flash-userdata.sh root.img 0
    ```
 
 3. **First boot = fixer boot.** The image was built without root on the Mac, so file owners/modes must be applied once on the phone. Still in TWRP:
@@ -80,10 +93,10 @@ Then in Settings > Accessibility enable **Reduce Transparency** and **Reduce Mot
 ### 2. Device tree, payload, boot image
 
 ```bash
-D22AP_ADT=ipsw/d22ap.adt python3 tools/mkadt.py a40.adt     # d22ap.adt: ipsw img4 im4p extract Firmware/all_flash/DeviceTree.d22ap.im4p
+D22AP_ADT=ipsw/d22ap.adt python3 tools/mkadt.py a40.adt --board a40     # d22ap.adt: ipsw img4 im4p extract Firmware/all_flash/DeviceTree.d22ap.im4p
 python3 tools/mkpayload.py kernel.development.sweet a40.adt loader/payload.bin --cmdline \
   'debug=0xc keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 cpus=2 sweetusb=0 sweetbattery=0 sweetfb_hz=30 sweetfb_noconsole=1'
-cd loader && PROG=loader16 BLOB=payload.bin ./build.sh /path/to/your/boot-backup.img   # -> out/boot.img
+cd loader && BOARD=a40 PROG=loader16 BLOB=payload.bin ./build.sh /path/to/your/A40-boot-backup.img   # -> out/boot.img
 ```
 For the fixer boot add `launchdsuffix=a40fix` to the command line (and `cpus=1` is fine).
 
@@ -91,7 +104,7 @@ For the fixer boot add `launchdsuffix=a40fix` to the command line (and `cpus=1` 
 
 ### 3. Testing without the phone (QEMU)
 
-`tools/qemu-a40.py` boots the same kernel on `qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a76` with the same memory map (RAM at 0x880000000, framebuffer at 0xEC000000) and a virtio disk instead of the eMMC (`mkadt.py --qemu`, `mkdisk.py` wraps the root in a GPT with a `userdata` partition). `tools/qrun.sh` dumps the kernel log ring from guest memory. A full boot to the lock screen takes ≈ 40 min under TCG.
+`tools/qemu-a40.py` models the A40 kernel on `qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a76` with the A40 memory map (RAM at 0x880000000, framebuffer at 0xEC000000) and a virtio disk instead of the eMMC (`mkadt.py OUT --board a40 --qemu`, `mkdisk.py` wraps the root in a GPT with a `userdata` partition). `tools/qrun.sh` dumps the kernel log ring from guest memory. Upstream reports ≈ 40 min to the lock screen under TCG. This does not validate A10 hardware.
 
 ## Debugging on the phone
 
@@ -101,7 +114,7 @@ For the fixer boot add `launchdsuffix=a40fix` to the command line (and `cpus=1` 
   S=$(adb shell cat /sys/block/mmcblk0/mmcblk0p32/size); adb shell "dd if=/dev/block/mmcblk0p32 bs=4096 skip=$((S/8-1025)) count=1025" > log.bin
   python3 tools/sweet-log.py log.bin > log.txt
   ```
-* Editing files of the iOS root from the Mac: `tools/pull-phone.py phone.img` (copy, verified), attach it with `hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount`, `mount -t hfs -o noowners`, edit, unmount, then `tools/push-sync.py phone.img` writes back only the changed MiBs.
+* Editing files of the A40 iOS root from the Mac: `BOARD=a40 tools/pull-phone.py phone.img` (copy, verified), attach it with `hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount`, `mount -t hfs -o noowners`, edit, unmount, then `BOARD=a40 tools/push-sync.py phone.img` writes back only the changed MiBs. These legacy tools still hardcode the A40 partition and are blocked without A40 selection.
 
 ## How it works (short)
 

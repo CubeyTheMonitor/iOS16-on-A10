@@ -1,6 +1,10 @@
 #!/bin/bash
 # Writes the HFS root (disk-fixed.img from 1 MiB, 16 GiB) to the A40 userdata in TWRP:
 # 256 MiB gz chunks via adb push (exec-in is broken on this TWRP), sha1-verified.
+if [ "${BOARD:-}" != a40 ]; then
+  echo 'A40-only legacy writer. A10 partition layout is unverified; refusing to run.' >&2
+  exit 1
+fi
 A="${ADB:-adb}${SERIAL:+ -s $SERIAL}"
 IMG=${1:?usage: flash-userdata.sh ROOT.img [OFFSET_MIB]}
 OFF=${2:-1}

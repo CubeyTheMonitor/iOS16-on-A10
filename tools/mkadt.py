@@ -6,22 +6,18 @@ Galaxy A40 (SM-A405FN, Exynos 7904): XNU runs on the two Cortex-A73 cores
 framebuffer left by S-Boot at 0xEC000000 (1080x2340, DECON SW trigger).
 --qemu: same kernel on QEMU virt (gic-version=2, virtio-mmio block device).
 
-Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+These are inherited A40 values, not a discovered A10 hardware profile.
+Usage: mkadt.py OUT.adt --board a40 [--dump] [--qemu]
 """
-import hashlib, os, struct, sys
+import argparse, hashlib, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
+from board import require_supported_board
 
-# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
+# Kernel-managed RAM from the A40 port's reported S-Boot map, not verified on A10.
 PHYS_BASE = 0x880000000          # A40 upper DDR bank (S-Boot DT: 0x880000000 + 2 GiB)
 MEM_SIZE = 0x80000000
-# --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
-# <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
-# carve-out is in the low bank and the dynamic pools are limited below 4G.
-HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -82,8 +78,11 @@ def node(name, props=(), children=()):
 CANVAS = (1125, 2436)
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, *, board=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+    require_supported_board(board)
+    if highmem:
+        raise ValueError('--highmem is an unimplemented inherited option; no RAM map selected')
     phys_base, mem_size = (QEMU_PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     gicd_size, gicr_size = (0x10000, QEMU_GICR_SIZE) if qemu else (GICD_SIZE, GICR_SIZE)
@@ -252,11 +251,22 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    if '--x2' in sys.argv:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('out')
+    ap.add_argument('--board', required=True, choices=('a40', 'a10'))
+    ap.add_argument('--qemu', action='store_true', help='A40 model on QEMU; not A10 validation')
+    ap.add_argument('--x2', action='store_true')
+    ap.add_argument('--dump', action='store_true')
+    ap.add_argument('--highmem', action='store_true', help='unsupported legacy option')
+    args = ap.parse_args()
+    if args.x2:
         CANVAS = (828, 1792)
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    try:
+        root = build(qemu=args.qemu, highmem=args.highmem, board=args.board)
+    except ValueError as exc:
+        ap.error(str(exc))
     blob = adt.serialize(root)
-    open(sys.argv[1], 'wb').write(blob)
-    if '--dump' in sys.argv:
+    open(args.out, 'wb').write(blob)
+    if args.dump:
         adt.dump(adt.parse(blob)[0])
-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    print(f'{args.out}: {len(blob)} bytes (A40 profile)', file=sys.stderr)

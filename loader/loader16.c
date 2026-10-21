@@ -8,6 +8,7 @@
  */
 #include "fbtext.h"
 #include "entry.h"
+#include "memory.h"
 
 #define BOOT_LINE_LENGTH 608
 #define PAGE_16K         0x4000UL
@@ -169,21 +170,6 @@ static u64 smc(u64 fn, u64 a1, u64 a2, u64 a3)
 	return x0;
 }
 
-static void copy64(u64 dst, u64 src, u64 n)
-{
-	volatile u64 *d = (volatile u64 *)dst;
-	const volatile u64 *s = (const volatile u64 *)src;
-	for (u64 i = 0; i < (n + 7) / 8; i++)
-		d[i] = s[i];
-}
-
-static void zero64(u64 dst, u64 n)
-{
-	volatile u64 *d = (volatile u64 *)dst;
-	for (u64 i = 0; i < n / 8; i++)
-		d[i] = 0;
-}
-
 static void kick(void)
 {
 	__asm__ volatile("dsb sy" ::: "memory");
@@ -278,8 +264,7 @@ __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vect
 		u64 dst = s->vmaddr + pa_of_va;
 		copy64(dst, (u64)p + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size) {
-			u64 z = (s->file_size + 7) & ~7UL;
-			zero64(dst + z, s->vmsize - z);
+			zero64(dst + s->file_size, s->vmsize - s->file_size);
 		}
 	}
 	u64 adt_pa = p->kernel_end + pa_of_va;
@@ -303,11 +288,11 @@ __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vect
 	ba->device_tree = adt_pa - pa_of_va;		/* adresse virtuelle */
 	ba->device_tree_length = (u32)p->adt_size;
 	int cl = 0;
-	for (; cl < BOOT_LINE_LENGTH && p->cmdline[cl]; cl++)
+	for (; cl < BOOT_LINE_LENGTH - 1 && p->cmdline[cl]; cl++)
 		ba->command_line[cl] = p->cmdline[cl];
 	u64 sec_pc;
 	__asm__ volatile("adr %0, sec_start" : "=r"(sec_pc));
-	if (cl + 30 < BOOT_LINE_LENGTH) {
+	if (cl + 26 < BOOT_LINE_LENGTH) {
 		const char *k = " a40sec=";
 		for (int i = 0; k[i]; i++)
 			ba->command_line[cl++] = k[i];

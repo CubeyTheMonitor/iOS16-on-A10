@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Extrait le payload de l'objet ELF et l'emballe en boot.img (en-tête Android v1) pour S-Boot.
 
-Usage : pack.py payload.o boot.img [--like boot-sauvegarde.img] [--blob noyau.macho]
+Usage : pack.py payload.o boot.img --board a40 --like boot-sauvegarde.img [--blob noyau.macho]
 
 --like recopie adresses, nom de carte, cmdline et os_version d'un boot.img existant
-(ta sauvegarde TWRP de PixelExperience). Sans lui, valeurs du BoardConfig du A40.
+(ta sauvegarde TWRP du A40). --board a40 et --like sont obligatoires.
 --blob ajoute un fichier (le noyau pour le loader) après le code, aligné sur 16 Ko ;
 son offset et sa taille vont dans les champs 0x20 et 0x28 de l'en-tête Image.
 """
-import argparse, gzip, hashlib, struct, sys
+import argparse, gzip, hashlib, os, struct, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../tools'))
+from board import require_supported_board
+from payload_format import validate
 
 HDR_SIZE = 1648
 
@@ -61,20 +65,22 @@ def empty_ramdisk():
     return gzip.compress(cpio, mtime=0)
 
 
-def defaults():
-    base = 0x10000000
-    return dict(kernel_addr=base + 0x8000, ramdisk_addr=base + 0x01000000,
-                second_addr=base + 0x00F00000, tags_addr=base + 0x100, page_size=2048,
-                os_version=0, name=b'SRPSA16C004RU', cmdline=b'', extra_cmdline=b'')
-
-
 def read_like(path):
-    h = open(path, 'rb').read(HDR_SIZE)
+    h = open(path, 'rb').read(1660)
+    if len(h) < 48:
+        raise ValueError(f'{path}: truncated Android boot header')
     if h[:8] != b'ANDROID!':
         sys.exit(f'{path} : pas un boot.img Android')
     (_, kaddr, _, raddr, _, saddr, taddr, page, ver, osv) = struct.unpack_from('<10I', h, 8)
     if ver > 2:
         sys.exit(f'{path} : en-tête v{ver}, attendu v0 à v2')
+    required_size = (1632, 1648, 1660)[ver]
+    if len(h) < required_size:
+        raise ValueError(f'{path}: truncated Android v{ver} boot header')
+    if page < required_size or page > 65536 or page & (page - 1):
+        raise ValueError(f'{path}: invalid boot page size {page}')
+    if ver and struct.unpack_from('<I', h, 1644)[0] != required_size:
+        raise ValueError(f'{path}: invalid Android v{ver} header_size')
     strip = lambda b: b.split(b'\0', 1)[0]
     return dict(kernel_addr=kaddr, ramdisk_addr=raddr, second_addr=saddr, tags_addr=taddr,
                 page_size=page, os_version=osv, name=strip(h[48:64]),
@@ -102,13 +108,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('elf')
     ap.add_argument('out')
-    ap.add_argument('--like')
+    ap.add_argument('--board', required=True, choices=('a40', 'a10'))
+    ap.add_argument('--like', required=True, help='boot backup from the selected board (does not validate hardware)')
     ap.add_argument('--blob')
     ap.add_argument('--ramdisk', help='image disque ajoutée après le blob (offset en 0x30, taille u32 en 0x3C)')
     a = ap.parse_args()
+    try:
+        require_supported_board(a.board)
+        fields = read_like(a.like)
+    except ValueError as exc:
+        ap.error(str(exc))
     kernel = elf_text(a.elf)
     if a.blob:
         blob = open(a.blob, 'rb').read()
+        if blob.startswith(b'SWEETXNU'):
+            validate(blob)
         off = (len(kernel) + 0x3FFF) & ~0x3FFF
         kernel = bytearray(kernel.ljust(off, b'\0') + blob)
         struct.pack_into('<Q', kernel, 0x10, len(kernel))
@@ -127,13 +141,11 @@ def main():
         # chargé vers 0x80100000 ; doit finir sous le journal de panique (0x8FFFC000)
         if 0x80200000 + len(kernel) > 0x8FFFC000:
             sys.exit('image trop grosse : dépasserait 0x8FFFC000 une fois chargée')
-    fields = read_like(a.like) if a.like else defaults()
     img = build(kernel, empty_ramdisk(), fields)
     open(a.out, 'wb').write(img)
     print(f'payload {len(kernel)} octets, {a.out} {len(img)} octets, '
           f'kernel_addr 0x{fields["kernel_addr"]:08x}, page {fields["page_size"]}, '
-          f'os_version 0x{fields["os_version"]:08x}'
-          + ('' if a.like else ' (valeurs par défaut, sans --like)'))
+          f'os_version 0x{fields["os_version"]:08x}')
 
 
 if __name__ == '__main__':

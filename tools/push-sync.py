@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Make the phone's userdata match NEW: compare sha1 per 256 MiB, then per MiB, and write differing MiBs."""
 import subprocess, sys, os, hashlib
+from board import require_supported_board
+require_supported_board(os.environ.get('BOARD'))
 A = [os.environ.get('ADB', 'adb')] + (['-s', os.environ['SERIAL']] if os.environ.get('SERIAL') else [])
 new = sys.argv[1]
 MB = 1 << 20; C = 256

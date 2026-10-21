@@ -2,6 +2,8 @@
 """Pull the first 16 GiB of the A40 userdata (iOS root) into a sparse file, 256 MiB
 chunks (adb exec-out stalls on long streams), each sha1-verified against the phone."""
 import subprocess, sys, zlib, os, hashlib
+from board import require_supported_board
+require_supported_board(os.environ.get('BOARD'))
 A = [os.environ.get('ADB', 'adb')] + (['-s', os.environ['SERIAL']] if os.environ.get('SERIAL') else [])
 out = sys.argv[1]
 start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
