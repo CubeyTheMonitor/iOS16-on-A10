@@ -9,6 +9,12 @@ The `a105g-hardware-evidence` branch adds offline inspection of saved files.
 It does not add an A10 boot image, enable A10 MMIO, flash a partition, or access
 a phone. The A40-only build and writer guards remain in place.
 
+Update: the user subsequently supplied a THL-labelled A105GDXS8CVL5 package.
+[The firmware analysis](firmware/a105gdxs8cvl5.md) confirms its SEA board
+description and SEC incell kernel configuration, records hashes and provenance
+limits, and adds an Android DT table unpacker. The source-only uncertainty below
+is preserved for context; actual handset RAM, panel and input remain unverified.
+
 ## Regional source finding
 
 The pinned Eureka commit is still

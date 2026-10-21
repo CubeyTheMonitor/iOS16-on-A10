@@ -4,3 +4,4 @@ root.img
 phone*.img
 out/
 __pycache__/
+firmware-evidence/

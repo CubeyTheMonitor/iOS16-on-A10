@@ -14,6 +14,11 @@ is currently unavailable. [SM-A105G evidence preparation](docs/sm-a105g-next-ste
 documents regional touchscreen uncertainty and the new offline DTB/GPT inspection
 tools. These tools read saved files and do not access a phone or enable A10 builds.
 
+[Analysis of the supplied A105GDXS8CVL5 firmware](docs/firmware/a105gdxs8cvl5.md)
+now identifies its SEA board description, SEC incell kernel configuration and
+static memory reservations. Its Android DT containers can be unpacked with
+`tools/unpack_dt_table.py`; these firmware facts still do not verify a physical boot.
+
 Run the offline checks with `bash tools/check-host.sh` (Python 3, a C compiler
 with AddressSanitizer/UBSan, and Git). These checks do not access a phone.
 

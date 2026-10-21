@@ -1,0 +1,458 @@
+{
+  "schema_version": 1,
+  "inspected_on": "2026-10-21",
+  "source": {
+    "host": "sf09.click",
+    "filename": "SAMFW.COM_SM-A105G_THL_A105GDXS8CVL5_fac.zip",
+    "archive_size": 3601198414,
+    "full_archive_downloaded": false,
+    "ap_zip_crc_verified": false,
+    "csc_zip_crc_verified": false,
+    "bl_zip_crc_verified": true,
+    "bl_appended_md5_verified": true,
+    "samsung_signature_authenticity_verified": false
+  },
+  "hardware_verified": false,
+  "package": {
+    "model": "SM-A105G",
+    "region_label": "THL",
+    "ap_build": "A105GDXS8CVL5",
+    "ap_android_label": "OS11",
+    "cp_build": "A105GDXS8CVL1",
+    "csc_build": "A105GOLM8CVG2",
+    "android_boot_header_version": 1,
+    "boot_page_size": 2048,
+    "boot_os_version": [
+      11,
+      0,
+      0
+    ],
+    "boot_security_patch": "2022-12",
+    "boot_header_kernel_address": "0x10008000",
+    "boot_header_tags_address": "0x10000100",
+    "boot_kernel_size": 29112000
+  },
+  "images": [
+    {
+      "name": "dt.img",
+      "size": 8388608,
+      "sha256": "8ef153dbf9a9f7f0274d13068de7dcbc6e59f38c86d6a7c2c2f950feabb17c39"
+    },
+    {
+      "name": "dtbo.img",
+      "size": 8388608,
+      "sha256": "58b5e34dd78fdf5d00c735996e7149864da2fc59efb93cf39c3146387a84d5e5"
+    },
+    {
+      "name": "boot.img",
+      "size": 37748736,
+      "sha256": "a7396f781c1a86b82c8b66b1f36b0189cb8d2256f0cf30f93739acf9fdb99d79"
+    },
+    {
+      "name": "recovery.img",
+      "size": 55574528,
+      "sha256": "54e3684ab7406d05446fdeb258bca99e3c8a1049085e9785991443dbe85edab1"
+    }
+  ],
+  "compressed_ap_members": [
+    {
+      "name": "boot.img.lz4",
+      "size": 16357451,
+      "sha256": "0aa6582d9d2e087106ef1cde1355e13ba672423d93285b2b7b199ea6115c8a25"
+    },
+    {
+      "name": "recovery.img.lz4",
+      "size": 30282614,
+      "sha256": "60fa05e3fa7124e6f26a63467d544ea913a170dd9a4666f6c5f6162a807a9f72"
+    },
+    {
+      "name": "dt.img.lz4",
+      "size": 65962,
+      "sha256": "bea9bdafc8e9b58af107f183ce52779c7c07f560bfc11550643c533a018d3284"
+    },
+    {
+      "name": "dtbo.img.lz4",
+      "size": 64840,
+      "sha256": "7d6e046437fdbc03a369c5ea770947f34e6582c52cdbf73b58092b628d4e8c95"
+    }
+  ],
+  "device_tree": {
+    "base_container": {
+      "schema_version": 1,
+      "hardware_verified": false,
+      "sha256": "8ef153dbf9a9f7f0274d13068de7dcbc6e59f38c86d6a7c2c2f950feabb17c39",
+      "file_size": 8388608,
+      "declared_size": 90364,
+      "trailing_bytes": 8298244,
+      "table_version": 0,
+      "container_page_size": 2048,
+      "entries": [
+        {
+          "index": 0,
+          "offset": 64,
+          "size": 90300,
+          "id": 0,
+          "revision": 0,
+          "custom": [
+            0,
+            255,
+            0,
+            0
+          ],
+          "kind": "base_or_merged",
+          "filename": "entry-0000.dtb",
+          "sha256": "bea53cb69955d22e7f5924354e1339d0eb63c9b140d147f766b25ab9ec58fdd9"
+        }
+      ]
+    },
+    "overlay_container": {
+      "schema_version": 1,
+      "hardware_verified": false,
+      "sha256": "58b5e34dd78fdf5d00c735996e7149864da2fc59efb93cf39c3146387a84d5e5",
+      "file_size": 8388608,
+      "declared_size": 88772,
+      "trailing_bytes": 8299836,
+      "table_version": 0,
+      "container_page_size": 2048,
+      "entries": [
+        {
+          "index": 0,
+          "offset": 64,
+          "size": 88708,
+          "id": 0,
+          "revision": 0,
+          "custom": [
+            0,
+            255,
+            0,
+            0
+          ],
+          "kind": "overlay",
+          "filename": "entry-0000.dtb",
+          "sha256": "41cb9968670df06b767cc1308dc66fed3cf7c5276832c69efcd4b918c1ea8ae7"
+        }
+      ]
+    },
+    "merge_tool": "pylibfdt 1.7.2.post2 (libfdt 1.7.2)",
+    "overlay_application_result": 0,
+    "merged_sha256": "66a0bf617b3d8f3db48bd7d30674be6a579038dd3cb4ad9d7d2a0fa6dcb79f47",
+    "merged_model": [
+      "Samsung A10 SEA OPEN 00 board based on EXYNOS7884B"
+    ],
+    "memory_nodes": [
+      {
+        "path": "/memory@80000000",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [],
+        "reg": [
+          {
+            "address": 2147483648,
+            "size": 1033895936
+          }
+        ],
+        "address_space": "/"
+      },
+      {
+        "path": "/memory@C0000000",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [],
+        "reg": [
+          {
+            "address": 3221225472,
+            "size": 1073741824
+          }
+        ],
+        "address_space": "/"
+      },
+      {
+        "path": "/memory@880000000",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [],
+        "reg": [
+          {
+            "address": 36507222016,
+            "size": 0
+          }
+        ],
+        "address_space": "/"
+      },
+      {
+        "path": "/memory@900000000",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [],
+        "reg": [
+          {
+            "address": 38654705664,
+            "size": 0
+          }
+        ],
+        "address_space": "/"
+      }
+    ],
+    "fdt_reservations": [
+      {
+        "address": 3758096384,
+        "size": 13631488
+      }
+    ],
+    "reserved_memory": [
+      {
+        "path": "/reserved-memory/video_frame",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos8890-ion,vframe"
+        ],
+        "dynamic": true,
+        "no_map": false,
+        "requested_size": 41943040
+      },
+      {
+        "path": "/reserved-memory/framebuffer@0xEC000000",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,dpu_fb_handover"
+        ],
+        "reg": [
+          {
+            "address": 3959422976,
+            "size": 20971520
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/modem_if",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,modem_if"
+        ],
+        "reg": [
+          {
+            "address": 4114612224,
+            "size": 125829120
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/cp_ram_logging",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,cp_ram_logging"
+        ],
+        "reg": [
+          {
+            "address": 4240441344,
+            "size": 33554432
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/gnss_if",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,gnss_if"
+        ],
+        "reg": [
+          {
+            "address": 4290772992,
+            "size": 4194304
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/tima_region@0xB8000000",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "removed-dma-pool"
+        ],
+        "reg": [
+          {
+            "address": 3087007744,
+            "size": 2097152
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/sec_debug_magic",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,sec_debug_magic"
+        ],
+        "reg": [
+          {
+            "address": 2147483648,
+            "size": 4096
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/seclog_mem",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,seclog"
+        ],
+        "reg": [
+          {
+            "address": 3221225472,
+            "size": 524288
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/wifibt_if",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,wifibt_if"
+        ],
+        "reg": [
+          {
+            "address": 3909091328,
+            "size": 4194304
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/abox_rmem@0xE9400000",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,abox_rmem"
+        ],
+        "reg": [
+          {
+            "address": 3913285632,
+            "size": 4194304
+          }
+        ],
+        "address_space": "/reserved-memory",
+        "dynamic": false,
+        "no_map": false
+      },
+      {
+        "path": "/reserved-memory/btabox_rmem",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos,btabox_rmem"
+        ],
+        "dynamic": true,
+        "no_map": false,
+        "requested_size": 4194304
+      },
+      {
+        "path": "/reserved-memory/crypto",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos8890-ion,crypto"
+        ],
+        "dynamic": true,
+        "no_map": false,
+        "requested_size": 33554432
+      },
+      {
+        "path": "/reserved-memory/video_stream",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "exynos8890-ion,vstream"
+        ],
+        "dynamic": true,
+        "no_map": false,
+        "requested_size": 75497472
+      }
+    ],
+    "touch_candidates": [
+      {
+        "path": "/hsi2c@13930000/touchscreen@48",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": [
+          "sec,sec_ts"
+        ],
+        "reg": [
+          {
+            "address": 72,
+            "size": 0
+          }
+        ],
+        "address_space": "/hsi2c@13930000"
+      },
+      {
+        "path": "/i2c@13870000/mms_ts@48",
+        "status": "okay",
+        "enabled_with_ancestors": true,
+        "compatible": []
+      }
+    ]
+  },
+  "kernel": {
+    "version": "4.4.177-21848546",
+    "build_timestamp": "Tue Dec 20 18:30:29 KST 2022",
+    "ikconfig_sha256": "27f3714948ad986331949100e702834fac8d08e917cf5e891c6dc6efde4261a3",
+    "selected_config_lines": [
+      "CONFIG_ARM64_4K_PAGES=y",
+      "# CONFIG_ARM64_16K_PAGES is not set",
+      "# CONFIG_TOUCHSCREEN_ZINITIX_BT532 is not set",
+      "# CONFIG_TOUCHSCREEN_ZINITIX_BT541C is not set",
+      "# CONFIG_TOUCHSCREEN_ZINITIX_ZT75XX is not set",
+      "# CONFIG_TOUCHSCREEN_ZINITIX_ZT75XX_TCLM is not set",
+      "# CONFIG_TOUCHSCREEN_ZINITIX_ZT75XX_WISDOM is not set",
+      "CONFIG_TOUCHSCREEN_SEC_INCELL_TS=y",
+      "# CONFIG_TOUCHSCREEN_MELFAS_MMS438 is not set",
+      "# CONFIG_TOUCHSCREEN_MELFAS_MSS100 is not set",
+      "# CONFIG_TOUCHSCREEN_MELFAS_MSS100_A30KOR is not set",
+      "CONFIG_EXYNOS_DECON_LCD_S6D7AT0B_A10=y"
+    ]
+  },
+  "pit": {
+    "archive_member": "A10_SWA_OPEN.pit",
+    "sha256": "c99d7c39fa830a13cebe41a044bb25910b15487efba02272056483632a3a2dd6",
+    "entry_count": 37,
+    "userdata_pit_identifier": 32,
+    "userdata_linux_block_path": null,
+    "live_gpt_verified": false
+  },
+  "limitations": [
+    "Static firmware tree, not the live S-Boot handoff or installed phone firmware.",
+    "AP and CSC ZIP entries were read partially; their complete CRC/MD5 checks were not performed.",
+    "No Samsung trust-root authentication or physical boot test was performed.",
+    "No RAM window, partition number or A10 boot profile was enabled."
+  ]
+}
