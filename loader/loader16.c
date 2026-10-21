@@ -9,26 +9,13 @@
 #include "fbtext.h"
 #include "entry.h"
 #include "memory.h"
+#include "fdt_memory.h"
+#include "payload_check.h"
 
-#define BOOT_LINE_LENGTH 608
-#define PAGE_16K         0x4000UL
 #define PSCI_CPU_ON      0xC4000003UL
 #define PSCI_CPU_OFF     0x84000002UL
 #define PSCI_VERSION     0x84000000UL
 #define A73_MPIDR        0x000UL
-
-struct payload_seg {
-	u64 vmaddr, vmsize, file_off, file_size;
-};
-
-struct payload {
-	char magic[8];
-	u32 version, nsegs;
-	u64 virt_base, entry_va, adt_off, adt_size, kernel_end;
-	u64 phys_base, mem_size;
-	char cmdline[BOOT_LINE_LENGTH];
-	struct payload_seg segs[];
-};
 
 struct boot_video {
 	u64 base, display, row_bytes, width, height, depth;
@@ -49,6 +36,25 @@ _Static_assert(__builtin_offsetof(struct payload, segs) == 0x2a8, "payload heade
 _Static_assert(__builtin_offsetof(struct boot_args, video) == 40, "boot_args");
 _Static_assert(__builtin_offsetof(struct boot_args, command_line) == 108, "boot_args");
 _Static_assert(sizeof(struct boot_args) == 736, "boot_args");
+
+/* Readable with a debugger after a silent preflight halt. No display/MMIO is
+ * used until the map, payload and this binary's A40 display profile pass.
+ * Errors 1..FM_OVERLAY: memory reader; 0x100+PC_*: payload; 0x200: image;
+ * 0x300: board profile; 0x400: exception before display initialization.
+ */
+__attribute__((used)) static volatile struct {
+	u64 signature, fdt_pa, map_pa, image_pa, image_size, esr, far;
+	u32 stage, error;
+} loader_diagnostics;
+__attribute__((used)) static struct fm_map handoff_map;
+static volatile u32 display_ready;
+
+static __attribute__((noreturn)) void early_stop(u32 error)
+{
+	loader_diagnostics.error = error;
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (;;) __asm__ volatile("wfe");
+}
 
 /* Lus par le A73 au démarrage (mémoire non cacheable des deux côtés). */
 __attribute__((used)) static volatile u64 a73_entry_pa, a73_boot_args, a73_alive;
@@ -238,39 +244,64 @@ static void fail(const char *why)
 
 __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vectors_ok)
 {
-	(void)fdt;
 	(void)vectors_ok;
+	display_ready = 0;
+	loader_diagnostics.signature = 0x4c4d454d00000001UL;
+	loader_diagnostics.stage = 1;
+	loader_diagnostics.error = 0;
+	loader_diagnostics.fdt_pa = (u64)fdt;
+	loader_diagnostics.map_pa = (u64)&handoff_map;
+	loader_diagnostics.image_pa = base;
+	/* The boot protocol must provide readable header/tree memory. Bounds
+	 * checks cannot turn an unmapped physical pointer into a valid one. */
+	if (!fdt || (u64)fdt > UINT64_MAX - 40) early_stop(FM_HEADER);
+	u32 fdt_size = fm_be32(fdt + 4);
+	if (fdt_size < 40 || fdt_size > FM_MAX_DTB || fdt_size > UINT64_MAX - (u64)fdt)
+		early_stop(FM_BOUNDS);
+	int error = fm_parse(fdt, fdt_size, &handoff_map);
+	if (error) early_stop((u32)error);
+	loader_diagnostics.stage = 2;
+	if (base > UINT64_MAX - 64) early_stop(0x200);
+	u64 image_size = *(const u64 *)(base + 0x10);
+	u64 blob_off = *(const u64 *)(base + 0x20), blob_size = *(const u64 *)(base + 0x28);
+	loader_diagnostics.image_size = image_size;
+	if (image_size < 64 || image_size > UINT64_MAX - base || blob_off < 64 || blob_off % 8 ||
+	    blob_off > image_size || blob_size > image_size - blob_off) early_stop(0x200);
+	const struct payload *p = (const struct payload *)(base + blob_off);
+	struct pc_layout layout;
+	error = pc_validate(p, blob_size, &layout);
+	if (error) early_stop(0x100 + (u32)error);
+	loader_diagnostics.stage = 3;
+	struct fm_range protected[2] = {{base, image_size}, {(u64)fdt, fdt_size}};
+	error = fm_check_window(&handoff_map, p->phys_base, p->mem_size, protected, 2);
+	if (error) early_stop((u32)error);
+	loader_diagnostics.stage = 4;
+	/* The memory reader is generic. This display/PMU binary is still A40-only.
+	 * In particular, a parsed A10 tree must not start A40 framebuffer writes. */
+	if (!fm_prefix((const u8 *)handoff_map.model, sizeof(handoff_map.model), "Samsung A40") ||
+	    (handoff_map.model[11] && handoff_map.model[11] != ' ')) early_stop(0x300);
+	display_ready = 1;
+	loader_diagnostics.stage = 5;
 	fill(0, FB_H, C_BG);
 	line = 0;
 	say("A40 IOS16 LOADER", C_OK);
 
-	u64 blob_off = *(const u64 *)(base + 0x20), blob_size = *(const u64 *)(base + 0x28);
-	if (!blob_off || !blob_size)
-		fail("PAS DE PAYLOAD");
-	const struct payload *p = (const struct payload *)(base + blob_off);
-	const char *m = p->magic, *want = "SWEETXNU";
-	for (int i = 0; i < 8; i++)
-		if (m[i] != want[i])
-			fail("PAYLOAD: MAUVAIS MAGIC");
-	if (p->version != 1 || (p->adt_off & 7))
-		fail("PAYLOAD: MAUVAIS ENTETE");
 	say_hex("PHYS: ", p->phys_base, 9);
 	say_hex("TAILLE PAYLOAD: ", blob_size, 8);
 	kick();
 
-	u64 pa_of_va = p->phys_base - p->virt_base;
 	for (u32 i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
-		u64 dst = s->vmaddr + pa_of_va;
+		u64 dst = p->phys_base + (s->vmaddr - p->virt_base);
 		copy64(dst, (u64)p + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size) {
 			zero64(dst + s->file_size, s->vmsize - s->file_size);
 		}
 	}
-	u64 adt_pa = p->kernel_end + pa_of_va;
+	u64 adt_pa = layout.adt_pa;
 	copy64(adt_pa, (u64)p + p->adt_off, p->adt_size);
-	u64 ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
-	u64 top = ba_pa + PAGE_16K;
+	u64 ba_pa = layout.args_pa;
+	u64 top = layout.top;
 	zero64(ba_pa, PAGE_16K);
 	volatile struct boot_args *ba = (volatile struct boot_args *)ba_pa;
 	ba->revision = 2;
@@ -285,7 +316,7 @@ __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vect
 	ba->video.width = FB_W;
 	ba->video.height = FB_H;
 	ba->video.depth = 32;
-	ba->device_tree = adt_pa - pa_of_va;		/* adresse virtuelle */
+	ba->device_tree = p->kernel_end;		/* adresse virtuelle */
 	ba->device_tree_length = (u32)p->adt_size;
 	int cl = 0;
 	for (; cl < BOOT_LINE_LENGTH - 1 && p->cmdline[cl]; cl++)
@@ -303,7 +334,7 @@ __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vect
 	ba->mem_size_actual = p->mem_size;
 	say_hex("BOOT_ARGS: ", ba_pa, 9);
 
-	a73_entry_pa = p->entry_va + pa_of_va;
+	a73_entry_pa = layout.entry_pa;
 	a73_boot_args = ba_pa;
 	a73_alive = 0;
 	say_hex("ENTREE XNU: ", a73_entry_pa, 9);
@@ -328,6 +359,11 @@ __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vect
 
 __attribute__((used)) static void payload_fault(u64 vec, u64 esr, u64 elr, u64 far, u64 base)
 {
+	if (!display_ready) {
+		loader_diagnostics.esr = esr;
+		loader_diagnostics.far = far;
+		early_stop(0x400);
+	}
 	fill(0, TOP + 7 * CELL_H, C_ERR);
 	line = 0;
 	say("EXCEPTION DANS LE LOADER", C_FG);

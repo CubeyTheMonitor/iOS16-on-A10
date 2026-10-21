@@ -41,6 +41,11 @@ revision, panel, bootloader and installed firmware before selecting a profile.
 | eMMC | Polled dw_mmc, bootloader card state, HCON FIFO-width detection, GPT name lookup; host scripts hardcode `mmcblk0p32` | `dwmmc_0` at `0x13500000`, separate CMDQ resource, 8-bit slot, FIFO depth `0x40`, HS200/HS400 capabilities | Strongest driver reuse candidate: PIO transfers, timeouts, FIFO handling, 512-byte GPT translation. Verify live controller/card state, RCA, clocks, mode, capacity, cache and security before takeover. Discover partition by GPT label/UUID and bounds; no A10 partition index is assigned. |
 | Touchscreen | Zinitix ZT7548, address `0x20`, legacy I2C4 `0x13870000`, vendor registers such as `0xc000` | `sec,sec_ts` at `0x48` on HSI2C5 `0x13930000`; SEC **incell** driver selected | Reuse HID event delivery and scheduling patterns. Implement HSI2C transactions and SEC initialization/event handling separately. Replacing the Zinitix address or I2C base cannot work. |
 
+The follow-up [runtime memory validator](loader-memory-validation.md) replaces
+the ignored-FDT behavior described in the inherited-source comparison above.
+It checks a proposed window and halts on unresolved reservations; it does not
+select an A10 RAM window or enable the A40 hardware path for A10.
+
 ## Loader and memory constraints
 
 The [shared base DTS][soc] declares low memory nodes at `0x80000000` and

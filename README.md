@@ -19,6 +19,11 @@ now identifies its SEA board description, SEC incell kernel configuration and
 static memory reservations. Its Android DT containers can be unpacked with
 `tools/unpack_dt_table.py`; these firmware facts still do not verify a physical boot.
 
+[Runtime memory validation](docs/loader-memory-validation.md) now checks the
+bootloader-supplied FDT and the complete proposed XNU RAM window before payload
+copies or display/PMU access. Unresolved reservations halt the loader; A10 builds
+remain disabled. A compile-only ARM64 check is available without producing a boot image.
+
 Run the offline checks with `bash tools/check-host.sh` (Python 3, a C compiler
 with AddressSanitizer/UBSan, and Git). These checks do not access a phone.
 

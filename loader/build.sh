@@ -26,15 +26,6 @@ if [ "$PROG" = loader ] && [ -z "${BLOB:-}" ]; then
 	BLOB=out/testkernel.macho
 fi
 
-clang -target aarch64-none-elf -mcmodel=tiny -fno-pic -ffreestanding -fno-builtin \
-	-fno-stack-protector -fno-common -mgeneral-regs-only -mstrict-align -mcpu=cortex-a73 -O2 -Wall \
-	-Wno-unused-function -S $PROG.c -o out/$PROG.s
-
-# Données (police, variables) rangées dans .text : un seul bloc, adressé par adr.
-sed -E -e 's/^[[:space:]]*\.section[[:space:]]+\.(rodata|data|bss)[^,]*(,.*)?$/	.text/' \
-	-e 's/^[[:space:]]*\.(data|bss)[[:space:]]*$/	.text/' \
-	-e '/^[[:space:]]*\.local[[:space:]]/d' \
-	-e 's/^[[:space:]]*\.comm[[:space:]]+([^,]+),([0-9]+),([0-9]+)$/	.text\n	.balign \3\n\1:\n	.zero \2/' out/$PROG.s > out/$PROG-flat.s
-clang -target aarch64-none-elf -c out/$PROG-flat.s -o out/$PROG.o
+OUT_DIR=out ./compile.sh "$PROG"
 
 python3 pack.py out/$PROG.o out/boot.img --board "$BOARD" --like "$1" ${BLOB:+--blob "$BLOB"} ${RAMDISK:+--ramdisk "$RAMDISK"}
