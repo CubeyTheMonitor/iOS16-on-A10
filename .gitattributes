@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Unified-diff context has a required leading space before tabs/blank lines.
+*.patch whitespace=-blank-at-eol,-space-before-tab

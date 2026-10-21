@@ -4,6 +4,10 @@
 verified. The included boot images, hardware constants and installation guide
 below are inherited from the A40 project and must not be used on an A10.**
 
+An [experimental A10 source target](docs/a10-bringup.md) now provides a
+720×1520 loader build, matching XNU display patch, and an ADT generator with
+explicit RAM placement. It has not been physically tested or packaged for flashing.
+
 See [the source comparison and remaining hardware work](docs/a10-porting.md).
 Host tooling now requires explicit A40 selection; A10 selection is rejected
 until a verified hardware profile exists. A stock boot header alone cannot
@@ -22,7 +26,7 @@ static memory reservations. Its Android DT containers can be unpacked with
 [Runtime memory validation](docs/loader-memory-validation.md) now checks the
 bootloader-supplied FDT and the complete proposed XNU RAM window before payload
 copies or display/PMU access. Unresolved reservations halt the loader; A10 builds
-remain disabled. A compile-only ARM64 check is available without producing a boot image.
+remain disabled. Compile-only ARM64 checks are available for both board targets without producing a boot image.
 
 Run the offline checks with `bash tools/check-host.sh` (Python 3, a C compiler
 with AddressSanitizer/UBSan, and Git). These checks do not access a phone.

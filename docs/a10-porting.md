@@ -1,6 +1,6 @@
 # Galaxy A10 (SM-A105 / Exynos 7884B) port investigation
 
-Status: source comparison and offline groundwork only. No phone was accessed,
+Status: [experimental A10 loader/display target](a10-bringup.md) plus source comparison and offline checks. No phone was accessed,
 no partition was written, and no A10 boot is established. There is no A10 boot
 image in this change. The XNU patch and prebuilt images remain A40 artifacts.
 
@@ -43,8 +43,9 @@ revision, panel, bootloader and installed firmware before selecting a profile.
 
 The follow-up [runtime memory validator](loader-memory-validation.md) replaces
 the ignored-FDT behavior described in the inherited-source comparison above.
-It checks a proposed window and halts on unresolved reservations; it does not
-select an A10 RAM window or enable the A40 hardware path for A10.
+It checks a proposed window and halts on unresolved reservations. The later
+[A10 source target](a10-bringup.md) adds its own model gate and framebuffer
+profile; neither change selects an A10 RAM window.
 
 ## Loader and memory constraints
 

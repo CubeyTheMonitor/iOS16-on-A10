@@ -1,21 +1,23 @@
 /* Commun aux programmes bare-metal du A40 : types, écran, police, texte, lecture big-endian. */
 #pragma once
+#include "../include/exynos_profile.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
 typedef unsigned long u64;
 
 /* Écran laissé allumé par S-Boot (même dalle et adresse que l'A30 dans uniLoader). */
-#define FB_BASE   0xEC000000UL
-#define FB_W      1080
-#define FB_H      2340
-#define DECON_F_HW_SW_TRIG_CONTROL 0x14860070UL
+#define FB_BASE   EXYNOS_FB_ADDRESS
+#define FB_W      EXYNOS_FB_WIDTH
+#define FB_H      EXYNOS_FB_HEIGHT
+#define DECON_F_HW_SW_TRIG_CONTROL EXYNOS_DECON_TRIGGER
 
 #define SCALE     5
 #define CELL_W    (6 * SCALE)
 #define CELL_H    (10 * SCALE)
 #define TOP       120
 #define COLS      (FB_W / CELL_W)
+#define ROWS      ((FB_H - TOP) / CELL_H)
 
 #define C_BG      0xFF101830u
 #define C_FG      0xFFFFFFFFu
@@ -77,11 +79,16 @@ static const u8 font[64][7] = {
 	['!'-32] = {0x04,0x04,0x04,0x04,0x04,0x00,0x04},
 };
 
-static volatile u32 *const fb = (volatile u32 *)FB_BASE;
+#ifndef FBTEXT_BUFFER
+#define FBTEXT_BUFFER FB_BASE
+#endif
+static volatile u32 *const fb = (volatile u32 *)FBTEXT_BUFFER;
 static int line;
 
 static void fill(int y0, int y1, u32 c)
 {
+	if (y0 < 0) y0 = 0;
+	if (y1 > FB_H) y1 = FB_H;
 	for (int y = y0; y < y1; y++)
 		for (int x = 0; x < FB_W; x++)
 			fb[y * FB_W + x] = c;
@@ -89,6 +96,7 @@ static void fill(int y0, int y1, u32 c)
 
 static void draw_char(int col, int row, char ch, u32 fg)
 {
+	if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return;
 	if (ch >= 'a' && ch <= 'z')
 		ch -= 32;
 	if (ch < 32 || ch >= 96)
@@ -122,11 +130,15 @@ static int hex_at(int col, int row, u64 v, int digits, u32 fg)
 
 static void say(const char *label, u32 fg)
 {
+	if (line >= ROWS) line = 0;
+	fill(TOP + line * CELL_H, TOP + (line + 1) * CELL_H, C_BG);
 	puts_at(0, line++, label, fg);
 }
 
 static void say_hex(const char *label, u64 v, int digits)
 {
+	if (line >= ROWS) line = 0;
+	fill(TOP + line * CELL_H, TOP + (line + 1) * CELL_H, C_BG);
 	int col = puts_at(0, line, label, C_DIM);
 	hex_at(col, line++, v, digits, C_FG);
 }

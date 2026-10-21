@@ -1,5 +1,8 @@
 # Runtime memory validation groundwork
 
+The later [A10 source target](a10-bringup.md) adds an explicit compile-only
+A10 profile. The validation described here still runs before its hardware path.
+
 The loader now reads the incoming raw FDT v17 in `x0`, rather than discarding
 it. It validates the **entire** RAM window described by the SWEETXNU payload,
 including space XNU could allocate later. It does not select RAM addresses,
@@ -35,8 +38,10 @@ Before `fill`, `kick`, SMC/PMU operations, or payload-directed copies,
    secondary trampoline, payload source and optional ramdisk. Do not join
    adjacent banks or silently subtract holes. Any unresolved pool blocks
    acceptance even if the proposed window avoids the known fixed carve-outs.
-5. Require an A40 model string before reaching the inherited A40 display and
-   PMU implementation. An A10 tree cannot enable that path. The existing
+5. Require the model string selected at compilation: A40 by default or A10
+   for `BOARD=a10`. The A10 target also requires the entire pixel span inside a
+   fixed reservation (`0x301` on failure). A tree cannot switch a binary into
+   the other board profile. The existing
    `BOARD=a40` / `--board a40` packaging guards remain in place.
 
 `fdt_memory.h` and `payload_check.h` are allocation-free and use no libc or
@@ -68,11 +73,11 @@ external debug/memory-read method and are not automatically visible over USB.
 | 2 | FDT parsed |
 | 3 | Payload layout validated |
 | 4 | Whole RAM window accepted |
-| 5 | Legacy A40 model gate accepted; display path may begin |
+| 5 | Selected board gate accepted; display path may begin |
 
 Error `1..12` uses `enum fm_error`; `11` means unresolved reservations.
 `0x100 + enum pc_error` indicates a payload failure, `0x200` an Image extent
-failure, `0x300` the board gate, and `0x400` an early exception. A failed parse
+failure, `0x300` the board gate, `0x301` a missing framebuffer reservation, and `0x400` an early exception. A failed parse
 leaves `map.valid == 0`; partial inventory data must not authorize a handoff.
 
 ## Offline evidence and checks

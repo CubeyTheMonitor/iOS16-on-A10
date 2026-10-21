@@ -12,11 +12,17 @@ case "$prog" in
     ''|*[!a-zA-Z0-9_]*) echo 'Expected a local C program name without a suffix.' >&2; exit 1 ;;
 esac
 out_dir=${OUT_DIR:-out}
+board_flags=()
+case "${BOARD:-a40}" in
+    a40) ;;
+    a10) board_flags=(-DPORT_BOARD_A10=1); out_dir=${OUT_DIR:-out/a10} ;;
+    *) echo 'BOARD must be a40 or a10 (compile-only experimental target).' >&2; exit 1 ;;
+esac
 mkdir -p "$out_dir"
 "${CLANG:-clang}" -target aarch64-none-elf -mcmodel=tiny -fno-pic -ffreestanding -fno-builtin \
     -fno-stack-protector -fno-common -fno-unwind-tables -fno-asynchronous-unwind-tables \
     -mgeneral-regs-only -mstrict-align -mcpu=cortex-a73 -g0 -O2 -Wall -Wextra -Werror \
-    -Wno-unused-function -S "$prog.c" -o "$out_dir/$prog.s"
+    -Wno-unused-function "${board_flags[@]}" -S "$prog.c" -o "$out_dir/$prog.s"
 
 # Keep code, constants and zero-initialized storage together for ADR addressing.
 sed -E -e 's/^[[:space:]]*\.section[[:space:]]+\.(rodata|data|bss)[^,]*(,.*)?$/\t.text/' \

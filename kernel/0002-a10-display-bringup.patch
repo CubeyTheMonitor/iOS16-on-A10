@@ -1,0 +1,107 @@
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -23,7 +23,12 @@
+  * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+  * clusters yet).
+  */
++#if defined(SWEET_A10)
++/* First A10 target: one A73 until secondary startup is measured. */
++#define SWEET_SMP_MAX_CPUS         1
++#else
+ #define SWEET_SMP_MAX_CPUS         8
++#endif
+ 
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8
+@@ -54,9 +59,18 @@
+  * QEMU (tools/qemu-a40.py) keeps the same addresses as plain RAM / ignored MMIO.
+  */
+ #define SWEET_FB_PHYS             0xEC000000ULL
++#if defined(SWEET_A10)
++/* Experimental A10 scanout, independently corroborated by uniLoader A10.
++ * Firmware's framebuffer carve-out contains the pixel span. Physical scanout
++ * format/stride and the DECON trigger still require a real handoff test. */
++#define SWEET_FB_W                720
++#define SWEET_FB_H                1520
++#define SWEET_FB_STRIDE           2880
++#else
+ #define SWEET_FB_W                1080
+ #define SWEET_FB_H                2340
+ #define SWEET_FB_STRIDE           4320
++#endif
+ #define SWEET_DECON_PHYS          0x14000000ULL   /* 32 MB block holding DECON (0x14860000) */
+ #define SWEET_DECON_TRIG_OFF      0x860070
+ #define SWEET_DECON_TRIG_VAL      0x1281
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -289,8 +289,8 @@
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
+ 	msr		DAIFSet, #0xf
+-	/* A40 diag: white band (rows 2200-2219) as the very first sign of life, MMU off */
+-	MOV64	x1, (SWEET_FB_PHYS + 2200 * SWEET_FB_STRIDE)
++	/* Board-relative 20-row band, entirely within either panel. */
++	MOV64	x1, (SWEET_FB_PHYS + (SWEET_FB_H - 80) * SWEET_FB_STRIDE)
+ 	MOV64	x2, (20 * SWEET_FB_STRIDE / 4)
+ 	mov		w3, #-1
+ 1:	str		w3, [x1], #4
+@@ -527,10 +527,10 @@
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (SWEET_FB_PHYS + 2300 * SWEET_FB_STRIDE)
++	MOV64	x0, (SWEET_FB_PHYS + (SWEET_FB_H - 40) * SWEET_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #SWEET_FB_STRIDE
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -171,7 +171,12 @@
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
++#if defined(SWEET_A10)
++	/* Present 720x1520 directly on the initial A10 target. */
++	int native = 1;
++#else
+ 	int native = 0;
++#endif
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+diff --git a/bsd/dev/a40_keys.c b/bsd/dev/a40_keys.c
+--- a/bsd/dev/a40_keys.c
++++ b/bsd/dev/a40_keys.c
+@@ -50,7 +50,10 @@
+ a40_platform(void)
+ {
+ 	DTEntry node;
+-	return SecureDTLookupEntry(NULL, "/a40-mmc", &node) == kSuccess ||
++	/* A10 RAM-disk bring-up has no storage or legacy touch node. Still
++	 * suppress the unrelated Qualcomm SPMI/GENI backends. */
++	return SecureDTLookupEntry(NULL, "/exynos-platform", &node) == kSuccess ||
++	    SecureDTLookupEntry(NULL, "/a40-mmc", &node) == kSuccess ||
+ 	       SecureDTLookupEntry(NULL, "/a40-virtio", &node) == kSuccess;
+ }
+ 
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -62,6 +62,10 @@
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto -mcpu=cortex-a73
++# Apply the A10 selection consistently to C, C++ and assembly compilations.
++ifeq ($(EXYNOS_BOARD),a10)
++MACHINE_FLAGS_ARM64_SWEET += -DSWEET_A10=1
++endif
+ 
+ 
+ #

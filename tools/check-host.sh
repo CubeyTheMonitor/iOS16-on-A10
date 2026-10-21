@@ -9,8 +9,10 @@ for script in loader/*.sh tools/*.sh; do
 done
 test_bin=$(mktemp /tmp/a10-host-check.XXXXXX)
 trap 'rm -f "$test_bin"' EXIT
-"${CC:-cc}" -std=gnu11 -ffreestanding -fno-builtin -fsyntax-only \
-    -Wall -Wextra -Werror -Wno-unused-function loader/loader16.c
+for profile_flag in -DPORT_BOARD_A10=1 -DPORT_BOARD_A40=1; do
+    "${CC:-cc}" -std=gnu11 -ffreestanding -fno-builtin -fsyntax-only \
+        -Wall -Wextra -Werror -Wno-unused-function "$profile_flag" loader/loader16.c
+done
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -pedantic -g \
     -fsanitize=address,undefined -fno-omit-frame-pointer tests/test_portable.c -o "$test_bin"
 "$test_bin"

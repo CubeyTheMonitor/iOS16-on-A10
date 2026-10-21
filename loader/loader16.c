@@ -1,5 +1,5 @@
 /*
- * Loader iOS 16 pour Galaxy A40 (fork ios-sweet) : démarré par S-Boot sur un Cortex-A53,
+ * Experimental A10 / inherited A40 iOS 16 loader (fork ios-sweet) : démarré par S-Boot sur un Cortex-A53,
  * il copie le payload SWEETXNU (noyau xnu-8796 + ADT, tools mkpayload.py) ajouté par
  * pack.py --blob, prépare boot_args (révision 2, ligne de commande 608 octets), puis
  * démarre XNU sur le premier Cortex-A73 (MPIDR 0x000) par PSCI CPU_ON : les A53 n'ont
@@ -11,6 +11,7 @@
 #include "memory.h"
 #include "fdt_memory.h"
 #include "payload_check.h"
+#include "board_check.h"
 
 #define PSCI_CPU_ON      0xC4000003UL
 #define PSCI_CPU_OFF     0x84000002UL
@@ -38,9 +39,9 @@ _Static_assert(__builtin_offsetof(struct boot_args, command_line) == 108, "boot_
 _Static_assert(sizeof(struct boot_args) == 736, "boot_args");
 
 /* Readable with a debugger after a silent preflight halt. No display/MMIO is
- * used until the map, payload and this binary's A40 display profile pass.
+ * used until the map, payload and the selected display profile pass.
  * Errors 1..FM_OVERLAY: memory reader; 0x100+PC_*: payload; 0x200: image;
- * 0x300: board profile; 0x400: exception before display initialization.
+ * 0x300/0x301: board profile/framebuffer reservation; 0x400: exception before display initialization.
  */
 __attribute__((used)) static volatile struct {
 	u64 signature, fdt_pa, map_pa, image_pa, image_size, esr, far;
@@ -58,6 +59,7 @@ static __attribute__((noreturn)) void early_stop(u32 error)
 
 /* Lus par le A73 au démarrage (mémoire non cacheable des deux côtés). */
 __attribute__((used)) static volatile u64 a73_entry_pa, a73_boot_args, a73_alive;
+__attribute__((used)) static volatile u64 a73_mmfr0, a73_feature_error;
 
 /*
  * Point d'entrée PSCI du A73 : x0 = context_id. Descend en EL1 si le firmware
@@ -68,29 +70,55 @@ __asm__(
 	".balign 8\n"
 	"a73_start:\n"
 	"	msr	daifset, #0xf\n"
-	/* bande de couleur à l'écran dès la 1re instruction : y = 2000 (A53) / 2150 (A73) */
+	/* Profile-relative diagnostic bands; neither can exceed the panel. */
 	"	mrs	x11, mpidr_el1\n"
 	"	ubfx	x11, x11, #8, #8\n"		/* Aff1 : 1 = A53, 0 = A73 */
-	"	movz	x9, #0xEC00, lsl #16\n"
-	"	movz	x12, #(4320 * 50 / 4)\n"	/* 50 lignes */
+	/* Check the actual A73 before drawing or advertising it as alive. */
+	"	cbnz	x11, 8f\n"
+	"	mrs	x9, CurrentEL\n"
+	"	cmp	x9, #4\n"
+	"	b.eq	10f\n"
+	"	cmp	x9, #8\n"
+	"	b.eq	10f\n"
+	"	adr	x10, a73_feature_error\n"
+	"	mov	x9, #2\n"
+	"	str	x9, [x10]\n"
+	"	dsb	sy\n"
+	"	b	9f\n"
+	"10:\n"
+	"	mrs	x9, id_aa64mmfr0_el1\n"
+	"	adr	x10, a73_mmfr0\n"
+	"	str	x9, [x10]\n"
+	"	ubfx	x9, x9, #20, #4\n"
+	"	cmp	x9, #1\n"
+	"	b.eq	8f\n"
+	"	adr	x10, a73_feature_error\n"
+	"	mov	x9, #1\n"
+	"	str	x9, [x10]\n"
+	"	dsb	sy\n"
+	"9:	wfe\n"
+	"	b	9b\n"
+	"8:\n"
+	"	movz	x9, #(" EXYNOS_ASM_STR(EXYNOS_FB_ADDRESS) " >> 16), lsl #16\n"
+	"	movz	x12, #(" EXYNOS_ASM_STR(EXYNOS_FB_STRIDE) " * 20 / 4)\n"	/* 20 rows, within either profile */
 	"	cbz	x11, 2f\n"
 	"	movz	x13, #0x00FF, lsl #16\n"	/* A53 : vert 0x0000FF00? -> rouge/vert selon ordre */
 	"	movk	x13, #0xFF00\n"
-	"	movz	x10, #(2000 * 4320 / 0x10000), lsl #16\n"
-	"	movk	x10, #((2000 * 4320) & 0xffff)\n"
+	"	movz	x10, #((" EXYNOS_ASM_STR(EXYNOS_FB_HEIGHT) " - 100) * " EXYNOS_ASM_STR(EXYNOS_FB_STRIDE) " / 0x10000), lsl #16\n"
+	"	movk	x10, #(((" EXYNOS_ASM_STR(EXYNOS_FB_HEIGHT) " - 100) * " EXYNOS_ASM_STR(EXYNOS_FB_STRIDE) ") & 0xffff)\n"
 	"	b	3f\n"
 	"2:	movz	x13, #0xFFFF, lsl #16\n"	/* A73 : blanc */
 	"	movk	x13, #0xFFFF\n"
-	"	movz	x10, #(2150 * 4320 / 0x10000), lsl #16\n"
-	"	movk	x10, #((2150 * 4320) & 0xffff)\n"
+	"	movz	x10, #((" EXYNOS_ASM_STR(EXYNOS_FB_HEIGHT) " - 60) * " EXYNOS_ASM_STR(EXYNOS_FB_STRIDE) " / 0x10000), lsl #16\n"
+	"	movk	x10, #(((" EXYNOS_ASM_STR(EXYNOS_FB_HEIGHT) " - 60) * " EXYNOS_ASM_STR(EXYNOS_FB_STRIDE) ") & 0xffff)\n"
 	"3:	add	x9, x9, x10\n"
 	"4:	str	w13, [x9], #4\n"
 	"	subs	x12, x12, #1\n"
 	"	b.ne	4b\n"
 	"	dsb	sy\n"
-	"	movz	x9, #0x1486, lsl #16\n"
-	"	movk	x9, #0x0070\n"
-	"	mov	w10, #0x1281\n"
+	"	movz	x9, #(" EXYNOS_ASM_STR(EXYNOS_DECON_TRIGGER) " >> 16), lsl #16\n"
+	"	movk	x9, #(" EXYNOS_ASM_STR(EXYNOS_DECON_TRIGGER) " & 0xffff)\n"
+	"	mov	w10, #" EXYNOS_ASM_STR(EXYNOS_DECON_VALUE) "\n"
 	"	str	w10, [x9]\n"
 	"	dsb	sy\n"
 	"	adr	x9, a73_alive\n"
@@ -179,7 +207,7 @@ static u64 smc(u64 fn, u64 a1, u64 a2, u64 a3)
 static void kick(void)
 {
 	__asm__ volatile("dsb sy" ::: "memory");
-	*(volatile u32 *)DECON_F_HW_SW_TRIG_CONTROL = 0x1281;
+	*(volatile u32 *)DECON_F_HW_SW_TRIG_CONTROL = EXYNOS_DECON_VALUE;
 }
 
 static void delay_ms(u64 ms)
@@ -220,12 +248,16 @@ static int start_core(const char *name, u64 mpidr, u64 pc, u64 arg, u64 want,
 	u64 r = smc(PSCI_CPU_ON, mpidr, pc, arg);
 	say_hex(" CPU_ON: ", r, 8);
 	kick();
-	for (int i = 0; i < 100 && a73_alive != want; i++)
+#if defined(PORT_BOARD_A10)
+	/* Do not power-cycle a core after PSCI refused the entry request. */
+	if (r != 0) return 0;
+#endif
+	for (int i = 0; i < 100 && a73_alive != want && !a73_feature_error; i++)
 		delay_ms(5);
 	say_hex(" APRES CPU_ON CFG/ST: ", ((u64)rd32(cfg) << 32) | rd32(cfg + 4), 16);
-	if (a73_alive != want) {
+	if (a73_alive != want && !a73_feature_error) {
 		pmu_core_on(shortstop, seqopt, cfg);
-		for (int i = 0; i < 400 && a73_alive != want; i++)
+		for (int i = 0; i < 400 && a73_alive != want && !a73_feature_error; i++)
 			delay_ms(5);
 		say_hex(" APRES PMU CFG/ST: ", ((u64)rd32(cfg) << 32) | rd32(cfg + 4), 16);
 	}
@@ -276,15 +308,15 @@ __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vect
 	error = fm_check_window(&handoff_map, p->phys_base, p->mem_size, protected, 2);
 	if (error) early_stop((u32)error);
 	loader_diagnostics.stage = 4;
-	/* The memory reader is generic. This display/PMU binary is still A40-only.
-	 * In particular, a parsed A10 tree must not start A40 framebuffer writes. */
-	if (!fm_prefix((const u8 *)handoff_map.model, sizeof(handoff_map.model), "Samsung A40") ||
-	    (handoff_map.model[11] && handoff_map.model[11] != ' ')) early_stop(0x300);
+	/* Select the source-built profile explicitly; a model cannot switch a
+	 * binary compiled for the other board into different hardware code. */
+	error = exynos_check_board(&handoff_map);
+	if (error) early_stop((u32)error);
 	display_ready = 1;
 	loader_diagnostics.stage = 5;
 	fill(0, FB_H, C_BG);
 	line = 0;
-	say("A40 IOS16 LOADER", C_OK);
+	say(EXYNOS_BOARD_LABEL, C_OK);
 
 	say_hex("PHYS: ", p->phys_base, 9);
 	say_hex("TAILLE PAYLOAD: ", blob_size, 8);
@@ -337,6 +369,8 @@ __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vect
 	a73_entry_pa = layout.entry_pa;
 	a73_boot_args = ba_pa;
 	a73_alive = 0;
+	a73_mmfr0 = 0;
+	a73_feature_error = 0;
 	say_hex("ENTREE XNU: ", a73_entry_pa, 9);
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 
@@ -347,8 +381,12 @@ __attribute__((used)) static void payload_main(const u8 *fdt, u64 base, u64 vect
 	u64 a73_pc;
 	__asm__ volatile("adr %0, a73_start" : "=r"(a73_pc));
 	say_hex("A73 PC: ", a73_pc, 9);
+#if EXYNOS_START_A53_WITNESS
 	start_core("A53 TEMOIN ", 0x101, a73_pc, ba_pa, 0xA53, 0, 0, PMU + 0x2280);
+#endif
 	start_core("A73 ", A73_MPIDR, a73_pc, ba_pa, 0xA73, 0x10900820, PMU + 0x2488, PMU + 0x2000);
+	if (a73_feature_error)
+		fail("A73: GRANULE 16K OU EL INVALIDE");
 	if (a73_alive != 0xA73)
 		fail("A73: PAS DE SIGNE DE VIE");
 	/* Le A73 efface l'écran en démarrant XNU : ne plus rien dessiner, s'éteindre. */
