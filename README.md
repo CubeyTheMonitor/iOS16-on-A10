@@ -1,3 +1,7 @@
+this is a fork of the iOS16 on A40
+
+This will be A10 (exynos7884/7885) soon.
+
 # iOS16 on A40
 
 iOS 16.7.16 (iPhone X userland, build 20H392) booting natively on the **Samsung Galaxy A40 (SM-A405FN, Exynos 7904)**: kernel, launchd, SpringBoard, lock screen, touch, buttons, both Cortex-A73 cores.
